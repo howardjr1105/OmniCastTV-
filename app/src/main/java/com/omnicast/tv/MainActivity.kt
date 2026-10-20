@@ -22,7 +22,6 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
-import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import java.io.File
@@ -70,13 +69,8 @@ class MainActivity : AppCompatActivity() {
         // Construir interfaz 100% nativa en Kotlin (Cero WebView)
         buildNativeTvUi(localIp)
 
-        // Inicializar ExoPlayer nativo con buffer de ultra-baja latencia
-        val loadControl = DefaultLoadControl.Builder()
-            .setBufferDurationsMs(500, 2000, 250, 500)
-            .build()
-        exoPlayer = ExoPlayer.Builder(this)
-            .setLoadControl(loadControl)
-            .build()
+        // Inicializar ExoPlayer nativo por hardware
+        exoPlayer = ExoPlayer.Builder(this).build()
         exoPlayerView.player = exoPlayer
 
         // Inicializar reproductor de audio PCM de baja latencia
@@ -224,12 +218,8 @@ class MainActivity : AppCompatActivity() {
         leftCard.addView(createLabel("PROTOCOLOS NATIVOS ACTIVOS EN RED LOCAL (IGUAL QUE AIRSCREEN)", "#38BDF8"))
         leftCard.addView(createTitle("1. AirPlay + Google Cast + DLNA", 20f))
         leftCard.addView(createBody(
-            "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV (Usa el receptor Cast de hardware con 0 lag).
-
-" +
-            "• iPhone / iPad / Mac (AirPlay Video y Fotos): Detectado automáticamente como 'OmniCast Google TV' (_airplay._tcp puerto 7000).
-
-" +
+            "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV (Usa el receptor Cast de hardware con 0 lag).\n\n" +
+            "• iPhone / iPad / Mac (AirPlay Video y Fotos): Detectado automáticamente como 'OmniCast Google TV' (_airplay._tcp puerto 7000).\n\n" +
             "• Windows / Android / iOS (DLNA / UPnP): Detectado en VLC, Galería y 'Transmitir en dispositivo' de Windows (SSDP puerto 1900)."
         ))
 
