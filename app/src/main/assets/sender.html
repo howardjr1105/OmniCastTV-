@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>OmniCast Native - Transmisor Hardware H.264</title>
+<style>
+  :root {
+    --bg: #070b14;
+    --card: #111827;
+    --border: #1f2937;
+    --accent: #10b981;
+    --blue: #38bdf8;
+    --danger: #ef4444;
+    --text: #f8fafc;
+    --muted: #94a3b8;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  body { background: var(--bg); color: var(--text); padding: 20px; max-width: 680px; margin: 0 auto; }
+  .hidden { display: none !important; }
+  .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 18px; }
+  .badge { background: rgba(16, 185, 129, 0.15); border: 1px solid var(--accent); color: #34d399; padding: 6px 12px; border-radius: 99px; font-size: 12px; font-weight: 700; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 22px; margin-bottom: 16px; }
+  h2 { font-size: 18px; margin-bottom: 6px; }
+  p { color: var(--muted); font-size: 13.5px; line-height: 1.5; }
+  .row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 14px; }
+  label { font-size: 11px; text-transform: uppercase; color: var(--muted); font-weight: 700; display: block; margin-bottom: 4px; }
+  select, input[type="file"] { width: 100%; background: #030712; border: 1px solid #374151; color: #fff; padding: 11px; border-radius: 10px; font-size: 13px; }
+  .btn { width: 100%; border: none; border-radius: 14px; padding: 15px; font-size: 15px; font-weight: 800; cursor: pointer; margin-top: 14px; display: flex; align-items: center; justify-content: center; gap: 8px; }
+  .btn-green { background: var(--accent); color: #052e16; }
+  .btn-blue { background: var(--blue); color: #082f49; }
+  .btn-red { background: var(--danger); color: #fff; }
+  .stats { font-family: monospace; font-size: 12px; color: #38bdf8; margin-top: 12px; background: #030712; padding: 10px; border-radius: 10px; }
+  code { background: #030712; color: #38bdf8; padding: 2px 6px; border-radius: 5px; font-family: monospace; user-select: all; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div>
+    <h1 style="font-size:21px; font-weight:800;">⚡ OmniCast Hardware Direct</h1>
+    <p style="font-size:12px;">H.264 Annex-B -> Google TV MediaCodec SurfaceView</p>
+  </div>
+  <div class="badge" id="ws-status">Conectando...</div>
+</div>
+
+<!-- TARJETA 1: DUPLICACIÓN DE PANTALLA POR HARDWARE WEBCODECS -> MEDIACODEC -->
+<div class="card">
+  <h2>1. Duplicación Ultra-Rápida (H.264 Baseline 0 B-Frames)</h2>
+  <p>Codifica en la GPU de tu equipo y envía paquetes NAL H.264 puros directo al chip decodificador de tu Google TV (sin WebView ni buffering).</p>
+
+  <div id="secure-hint" class="hidden" style="background:rgba(245,158,11,0.12); border:1px solid #f59e0b; padding:12px; border-radius:12px; margin-top:12px; font-size:12.5px; color:#fcd34d;">
+    ⚠️ Para capturar pantalla en HTTP, abre el puerto HTTPS o habilita esta IP en Brave/Chrome:<br>
+    1. Pega en otra pestaña: <code>brave://flags/#unsafely-treat-insecure-origin-as-secure</code><br>
+    2. Añade: <code id="curr-origin"></code> -> <b>Enabled</b> -> <b>Relaunch</b>.<br>
+    <button class="btn btn-blue" style="margin-top:8px; padding:10px;" onclick="window.location.href='https://' + window.location.hostname + ':8444'">
+      🔒 O abrir directamente en HTTPS (:8444)
+    </button>
+  </div>
+
+  <div class="row">
+    <div>
+      <label>Resolución</label>
+      <select id="cfg-res">
+        <option value="720">720p (Ultra Rápido)</option>
+        <option value="1080" selected>1080p (Full HD)</option>
+      </select>
+    </div>
+    <div>
+      <label>Cuadros/seg</label>
+      <select id="cfg-fps">
+        <option value="60" selected>60 FPS</option>
+        <option value="30">30 FPS</option>
+      </select>
+    </div>
+    <div>
+      <label>Bitrate LAN</label>
+      <select id="cfg-bitrate">
+        <option value="4000000">4 Mbps (Baja Latencia)</option>
+        <option value="8000000" selected>8 Mbps (Óptimo)</option>
+        <option value="15000000">15 Mbps (Máxima Nitidez)</option>
+      </select>
+    </div>
+  </div>
+
+  <button class="btn btn-green" id="btn-start" onclick="startHardwareMirror()">
+    🚀 Iniciar Stream Directo a MediaCodec
+  </button>
+  <button class="btn btn-red hidden" id="btn-stop" onclick="stopHardwareMirror()">
+    ⏹ Detener Transmisión
+  </button>
+
+  <div class="stats" id="stats-box">Estado: En espera · Decodificador del TV: SurfaceView Nativo</div>
+</div>
+
+<!-- TARJETA 2: ENVÍO DIRECTO DE VIDEO 4K / FOTOS (SIN RECODIFICAR) -->
+<div class="card">
+  <h2>2. Enviar Video 4K o Foto al ExoPlayer Nativo del TV (iOS / Android / Mac)</h2>
+  <p style="margin-bottom:10px;">Reproduce el archivo original directamente en el reproductor nativo por hardware del televisor.</p>
+  <input type="file" accept="video/*,image/*" onchange="uploadDirectMedia(this.files[0])" />
+  <div id="upload-msg" style="margin-top:8px; font-size:13px; color:#34d399; font-weight:700;"></div>
+</div>
+
+<script>
+  let ws = null;
+  let videoEncoder = null;
+  let mediaStream = null;
+  let audioCtx = null;
+  let frameCount = 0;
+  let running = false;
+
+  document.getElementById('curr-origin').textContent = window.location.origin;
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+    document.getElementById('secure-hint').classList.remove('hidden');
+  }
+
+  function connectSocket() {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${window.location.host}/ws`);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+      const badge = document.getElementById('ws-status');
+      badge.textContent = '● Conectado al Motor Nativo TV';
+    };
+    ws.onclose = () => setTimeout(connectSocket, 1200);
+  }
+  connectSocket();
+
+  async function startHardwareMirror() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+      document.getElementById('secure-hint').classList.remove('hidden');
+      return;
+    }
+
+    const height = parseInt(document.getElementById('cfg-res').value, 10);
+    const width = height === 1080 ? 1920 : 1280;
+    const fps = parseInt(document.getElementById('cfg-fps').value, 10);
+    const bitrate = parseInt(document.getElementById('cfg-bitrate').value, 10);
+
+    try {
+      mediaStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { width: { ideal: width }, height: { ideal: height }, frameRate: { ideal: fps } },
+        audio: true
+      });
+
+      const videoTrack = mediaStream.getVideoTracks()[0];
+      videoTrack.onended = () => stopHardwareMirror();
+      const settings = videoTrack.getSettings();
+      const encW = settings.width || width;
+      const encH = settings.height || height;
+
+      // 1. Avisar al TV que inicialice MediaCodec + SurfaceView
+      ws.send(JSON.stringify({ type: 'init_h264', width: encW, height: encH, fps: fps }));
+
+      running = true;
+      frameCount = 0;
+      document.getElementById('btn-start').classList.add('hidden');
+      document.getElementById('btn-stop').classList.remove('hidden');
+
+      // 2. Configurar codificador H.264 por Hardware (WebCodecs VideoEncoder, 0 B-Frames, Annex-B)
+      if ('VideoEncoder' in window && 'MediaStreamTrackProcessor' in window) {
+        videoEncoder = new VideoEncoder({
+          output: (chunk) => {
+            if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 512000) return;
+            const packet = new Uint8Array(1 + chunk.byteLength);
+            packet[0] = 1; // 0x01 = Paquete H.264 Annex-B NAL
+            chunk.copyTo(packet.subarray(1));
+            ws.send(packet.buffer);
+            frameCount++;
+            if (frameCount % 30 === 0) {
+              document.getElementById('stats-box').textContent =
+                `🔴 EN VIVO · H.264 Hardware (${encW}x${encH} @ ${fps}fps) · Cuadros enviados: ${frameCount} · Buffer red: ${(ws.bufferedAmount/1024).toFixed(1)} KB`;
+            }
+          },
+          error: (e) => console.error('Encoder error:', e)
+        });
+
+        videoEncoder.configure({
+          codec: 'avc1.42002a', // Constrained Baseline Profile Level 4.2 (0 B-frames = 0 ms de reordenamiento!)
+          width: encW,
+          height: encH,
+          bitrate: bitrate,
+          framerate: fps,
+          latencyMode: 'realtime',
+          hardwareAcceleration: 'prefer-hardware',
+          avc: { format: 'annexb' }
+        });
+
+        const processor = new MediaStreamTrackProcessor({ track: videoTrack });
+        const reader = processor.readable.getReader();
+
+        (async () => {
+          while (running) {
+            const { done, value: frame } = await reader.read();
+            if (done || !running) {
+              if (frame) frame.close();
+              break;
+            }
+            if (videoEncoder.encodeQueueSize <= 2) {
+              const isKeyFrame = (frameCount % (fps * 2)) === 0;
+              videoEncoder.encode(frame, { keyFrame: isKeyFrame });
+            }
+            frame.close();
+          }
+        })();
+      } else {
+        // Fallback universal con requestAnimationFrame -> VideoEncoder
+        const videoEl = document.createElement('video');
+        videoEl.srcObject = mediaStream;
+        videoEl.muted = true;
+        await videoEl.play();
+
+        videoEncoder = new VideoEncoder({
+          output: (chunk) => {
+            if (!ws || ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 512000) return;
+            const packet = new Uint8Array(1 + chunk.byteLength);
+            packet[0] = 1;
+            chunk.copyTo(packet.subarray(1));
+            ws.send(packet.buffer);
+            frameCount++;
+          },
+          error: (e) => console.error(e)
+        });
+
+        videoEncoder.configure({
+          codec: 'avc1.42002a',
+          width: encW,
+          height: encH,
+          bitrate: bitrate,
+          framerate: fps,
+          latencyMode: 'realtime',
+          hardwareAcceleration: 'prefer-hardware',
+          avc: { format: 'annexb' }
+        });
+
+        const loop = () => {
+          if (!running) return;
+          if (videoEl.readyState >= 2 && videoEncoder.encodeQueueSize <= 2) {
+            const vf = new VideoFrame(videoEl, { timestamp: performance.now() * 1000 });
+            videoEncoder.encode(vf, { keyFrame: (frameCount % (fps * 2)) === 0 });
+            vf.close();
+          }
+          requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+      }
+
+      // 3. Captura de Audio PCM 16-bit de baja latencia si la pantalla incluye audio
+      const audioTracks = mediaStream.getAudioTracks();
+      if (audioTracks.length > 0) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+        const source = audioCtx.createMediaStreamSource(new MediaStream([audioTracks[0]]));
+        const proc = audioCtx.createScriptProcessor(2048, 2, 2);
+        proc.onaudioprocess = (e) => {
+          if (!running || !ws || ws.readyState !== WebSocket.OPEN) return;
+          const left = e.inputBuffer.getChannelData(0);
+          const right = e.inputBuffer.numberOfChannels > 1 ? e.inputBuffer.getChannelData(1) : left;
+          const pcm16 = new Int16Array(left.length * 2);
+          for (let i = 0; i < left.length; i++) {
+            pcm16[i * 2] = Math.max(-1, Math.min(1, left[i])) * 0x7FFF;
+            pcm16[i * 2 + 1] = Math.max(-1, Math.min(1, right[i])) * 0x7FFF;
+          }
+          const pkt = new Uint8Array(1 + pcm16.byteLength);
+          pkt[0] = 2; // 0x02 = Audio PCM 16-bit
+          pkt.set(new Uint8Array(pcm16.buffer), 1);
+          ws.send(pkt.buffer);
+        };
+        source.connect(proc);
+        proc.connect(audioCtx.destination);
+      }
+    } catch (err) {
+      alert('Error al iniciar transmisión: ' + err.message);
+    }
+  }
+
+  function stopHardwareMirror() {
+    running = false;
+    if (videoEncoder) {
+      try { videoEncoder.close(); } catch (_) {}
+      videoEncoder = null;
+    }
+    if (audioCtx) {
+      try { audioCtx.close(); } catch (_) {}
+      audioCtx = null;
+    }
+    if (mediaStream) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      mediaStream = null;
+    }
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'stop' }));
+    }
+    document.getElementById('btn-start').classList.remove('hidden');
+    document.getElementById('btn-stop').classList.add('hidden');
+    document.getElementById('stats-box').textContent = 'Transmisión detenida.';
+  }
+
+  async function uploadDirectMedia(file) {
+    if (!file) return;
+    const msg = document.getElementById('upload-msg');
+    msg.textContent = `Enviando "${file.name}" al reproductor nativo del TV...`;
+    const ext = file.name.split('.').pop() || 'mp4';
+    try {
+      const res = await fetch('/upload', {
+        method: 'POST',
+        headers: { 'X-File-Ext': ext, 'X-File-Mime': file.type || 'video/mp4' },
+        body: file
+      });
+      if (res.ok) {
+        msg.textContent = '✅ Reproduciendo en el ExoPlayer nativo del Google TV';
+      }
+    } catch (e) {
+      msg.textContent = '❌ Error: ' + e.message;
+    }
+  }
+</script>
+</body>
+</html>

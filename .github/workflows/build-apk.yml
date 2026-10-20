@@ -1,12 +1,16 @@
-name: Compilar APK OmniCast TV
+name: Compilar y Publicar Release APK OmniCast TV
 
 on:
   push:
     branches: ["main", "master"]
   workflow_dispatch:
 
+# Permiso indispensable para que GitHub Actions pueda crear Releases y adjuntar el APK
+permissions:
+  contents: write
+
 jobs:
-  build:
+  build-and-release:
     runs-on: ubuntu-latest
     steps:
       - name: Clonar código
@@ -18,7 +22,7 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Aceptar licencias de Android SDK (Preinstalado en el Runner)
+      - name: Aceptar licencias de Android SDK
         run: |
           yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
@@ -27,14 +31,38 @@ jobs:
         with:
           gradle-version: "8.4"
 
-      - name: Compilar APK Debug y Release (Pre-firmado para Google TV)
+      - name: Compilar APK Release y Debug (Pre-firmados para Google TV)
         run: |
-          # Si subiste los archivos dentro de la subcarpeta OmniCastTV, entra a ella automáticamente:
           if [ -f "OmniCastTV/settings.gradle.kts" ]; then cd OmniCastTV; fi
-          gradle assembleDebug assembleRelease
+          gradle assembleRelease assembleDebug
 
-      - name: Subir APK listo para instalar en Google TV / Android TV
+          # Copiar y renombrar los APK en la raíz del workspace para su publicación
+          cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/OmniCastTV.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/OmniCastTV-debug.apk"
+
+      - name: Subir APK como Artefacto del Action
         uses: actions/upload-artifact@v4
         with:
-          name: OmniCastTV-APK
-          path: "**/app/build/outputs/apk/debug/app-debug.apk"
+          name: OmniCastTV-Native-APK
+          path: |
+            ${{ github.workspace }}/OmniCastTV.apk
+            ${{ github.workspace }}/OmniCastTV-debug.apk
+
+      - name: Publicar APK en GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v2.0.${{ github.run_number }}
+          name: "OmniCast Native TV v2.0.${{ github.run_number }}"
+          body: |
+            ### 📺 OmniCast Native TV (Google TV / Android TV)
+            * **Motor 100% Nativo por Hardware (`SurfaceView` + `MediaCodec` H.264 Low-Latency)**
+            * **Protocolos activos:** AirPlay (`_airplay._tcp` :7000), DLNA/UPnP (`SSDP` :1900) y Stream Binario H.264 (`:8080` / `:8444`).
+            * **Instalación directa en TV:** Descarga el archivo `OmniCastTV.apk` adjunto en esta versión.
+          draft: false
+          prerelease: false
+          make_latest: "true"
+          files: |
+            ${{ github.workspace }}/OmniCastTV.apk
+            ${{ github.workspace }}/OmniCastTV-debug.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
