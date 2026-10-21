@@ -52,7 +52,10 @@ val injectFairPlayEngine by tasks.registering {
 
         val fairPlayFile = File(targetJavaDir, "FairPlay.java")
         val omgHaxConstFile = File(targetJavaDir, "OmgHaxConst.java")
-        if (!fairPlayFile.exists() || !omgHaxConstFile.exists()) {
+        // OmgHaxConst carga table_s1..s10 con getResource("/table_sN"): sin ellas FairPlay falla con ExceptionInInitializerError
+        val tablesDir = file("src/main/resources")
+        tablesDir.mkdirs()
+        if (!fairPlayFile.exists() || !omgHaxConstFile.exists() || !File(tablesDir, "table_s10").exists()) {
             val urls = listOf(
                 "https://codeload.github.com/serezhka/java-airplay-lib/zip/refs/heads/master",
                 "https://github.com/serezhka/java-airplay-lib/archive/HEAD.zip",
@@ -115,6 +118,9 @@ val injectFairPlayEngine by tasks.registering {
                                         File(targetJavaDir, fileName).writeText(content, Charsets.UTF_8)
                                         copiedCount++
                                         println(">>> [OmniCast] Inyectado en com.omnicast.tv.playfair: $fileName")
+                                    } else if (Regex("table_s\\d+").matches(fileName) && entry.name.contains("/src/main/resources/")) {
+                                        File(tablesDir, fileName).writeBytes(zis.readBytes())
+                                        println(">>> [OmniCast] Inyectada tabla FairPlay: $fileName")
                                     } else if (lowerName == "info.plist") {
                                         val plistBytes = zis.readBytes()
                                         File(targetAssetsDir, "airplay_info.plist").writeBytes(plistBytes)
