@@ -284,10 +284,12 @@ class MainActivity : AppCompatActivity() {
 
     private fun startNativeHardwareMirror(width: Int, height: Int, fps: Int) {
         if (surfaceReady) {
-            if (h264Decoder == null) {
-                h264Decoder = HardwareH264Decoder(mirrorSurfaceView.holder.surface)
-            }
+            // Decoder nuevo en cada sesión: un Surface recreado (cambio de modo HDMI) deja inválido el anterior
+            h264Decoder?.stop()
+            h264Decoder = HardwareH264Decoder(mirrorSurfaceView.holder.surface) { appendTvLog(it) }
             h264Decoder?.start(width, height, fps)
+        } else {
+            appendTvLog("Superficie de video no lista: no se puede decodificar")
         }
         audioPlayer?.start(48000)
 

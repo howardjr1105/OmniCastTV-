@@ -88,6 +88,7 @@ class AirPlayBonjourService(
     @Volatile private var rawFairPlayAesKey: ByteArray? = null
     @Volatile private var setupEiv: ByteArray? = null
     @Volatile private var activeVideoCipher: Cipher? = null
+    @Volatile private var mirrorSocket: Socket? = null
     @Volatile private var cipherDiag = "SETUP sin ekey"
     private val ogBlock = ByteArray(16)
     @Volatile private var nextDecryptCount = 0
@@ -565,6 +566,9 @@ class AirPlayBonjourService(
 
     private fun handleMirroringVideoStream(socket: Socket) {
         logTv("¡Stream de pantalla H.264 conectado en puerto 7100!")
+        // Una conexión nueva reemplaza a la anterior; la vieja no debe detener el decoder de la nueva
+        mirrorSocket?.let { try { it.close() } catch (_: Throwable) {} }
+        mirrorSocket = socket
         try {
             socket.tcpNoDelay = true
             socket.receiveBufferSize = 1048576
@@ -632,7 +636,10 @@ class AirPlayBonjourService(
             logTv("Stream de pantalla finalizado: ${e.message}")
         } finally {
             try { socket.close() } catch (_: Throwable) {}
-            onStop()
+            if (mirrorSocket === socket) {
+                mirrorSocket = null
+                onStop()
+            }
         }
     }
 

@@ -13,7 +13,7 @@ import java.util.concurrent.TimeUnit
  * Decodificador H.264/AVC por Hardware directo a SurfaceView.
  * Garantiza que el paquete SPS/PPS (Codec Config) nunca se pierda al iniciar la sesión AirPlay.
  */
-class HardwareH264Decoder(private val surface: Surface) {
+class HardwareH264Decoder(private val surface: Surface, private val onError: (String) -> Unit = {}) {
 
     private var codec: MediaCodec? = null
     @Volatile private var isRunning = false
@@ -28,7 +28,7 @@ class HardwareH264Decoder(private val surface: Surface) {
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxOf(width * height, 4 * 1024 * 1024))
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -52,12 +52,15 @@ class HardwareH264Decoder(private val surface: Surface) {
                 while (isRunning) {
                     try {
                         val nal = nalQueue.poll(15, TimeUnit.MILLISECONDS) ?: continue
-                        val inIdx = localCodec.dequeueInputBuffer(10000)
+                        // Nunca descartar un cuadro: perder un P-frame corrompe la imagen hasta el siguiente IDR
+                        var inIdx = -1
+                        while (isRunning && inIdx < 0) inIdx = localCodec.dequeueInputBuffer(10000)
                         if (inIdx >= 0) {
                             val buf = localCodec.getInputBuffer(inIdx)
                             if (buf != null) {
                                 buf.clear()
                                 val len = minOf(nal.size, buf.remaining())
+                                if (len < nal.size) onError("Cuadro H.264 truncado (${nal.size}B > ${buf.capacity()}B)")
                                 buf.put(nal, 0, len)
                                 val nalType = findFirstNalType(nal)
                                 val flags = when (nalType) {
@@ -73,6 +76,8 @@ class HardwareH264Decoder(private val surface: Surface) {
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
+                        onError("Decoder entrada: ${e.javaClass.simpleName} ${e.message}")
+                        if (e is IllegalStateException) break
                     }
                 }
             }, "OmniCast-H264-In").apply { start() }
@@ -90,6 +95,8 @@ class HardwareH264Decoder(private val surface: Surface) {
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
+                        onError("Decoder salida: ${e.javaClass.simpleName} ${e.message}")
+                        if (e is IllegalStateException) break
                     }
                 }
             }, "OmniCast-H264-Out").apply { start() }
@@ -97,6 +104,7 @@ class HardwareH264Decoder(private val surface: Surface) {
             Log.i("HardwareH264Decoder", "MediaCodec H.264 iniciado ($width x $height @ $fps fps)")
         } catch (e: Exception) {
             Log.e("HardwareH264Decoder", "Error al iniciar MediaCodec: ${e.message}")
+            onError("Error iniciando MediaCodec: ${e.message}")
         }
     }
 
