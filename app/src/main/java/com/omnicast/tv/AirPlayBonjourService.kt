@@ -719,6 +719,34 @@ class AirPlayBonjourService(
         display["rotation"] = NSNumber(false)
         root["displays"] = NSArray(display)
 
+        // Sin audioFormats/audioLatencies macOS no puede crear el dispositivo de audio del receptor
+        // y cancela la duplicación a los ~60 s (AVVideoController set output failed: 3)
+        val af0 = NSDictionary().apply {
+            put("type", NSNumber(100))
+            put("audioInputFormats", NSNumber(67108860))
+            put("audioOutputFormats", NSNumber(67108860))
+        }
+        val af1 = NSDictionary().apply {
+            put("type", NSNumber(101))
+            put("audioInputFormats", NSNumber(67108860))
+            put("audioOutputFormats", NSNumber(67108860))
+        }
+        root["audioFormats"] = NSArray(af0, af1)
+
+        val al0 = NSDictionary().apply {
+            put("type", NSNumber(100))
+            put("audioType", NSString("default"))
+            put("inputLatencyMicros", NSNumber(false))
+            put("outputLatencyMicros", NSNumber(false))
+        }
+        val al1 = NSDictionary().apply {
+            put("type", NSNumber(101))
+            put("audioType", NSString("default"))
+            put("inputLatencyMicros", NSNumber(false))
+            put("outputLatencyMicros", NSNumber(false))
+        }
+        root["audioLatencies"] = NSArray(al0, al1)
+
         return BinaryPropertyListWriter.writeToArray(root)
     }
 
