@@ -30,7 +30,7 @@ import java.net.NetworkInterface
 
 /**
  * Actividad 100% Nativa para Google TV / Android TV (CERO WebView).
- * Renderiza directamente sobre SurfaceView por Hardware (MediaCodec H.264 Low-Latency + ExoPlayer + AirPlay + DLNA).
+ * Renderiza directamente sobre SurfaceView por Hardware (MediaCodec H.264 Low-Latency + ExoPlayer + AirPlay 2 + DLNA).
  */
 class MainActivity : AppCompatActivity() {
 
@@ -79,10 +79,16 @@ class MainActivity : AppCompatActivity() {
         // 1. Iniciar Demonio DLNA / UPnP MediaRenderer (Puerto 1900 UDP)
         dlnaService = DlnaSsdpService(localIp, 8080, "OmniCast Google TV").also { it.start() }
 
-        // 2. Iniciar Demonio AirPlay + Bonjour mDNS (_airplay._tcp.local. Puerto 7000)
+        // 2. Iniciar Demonio AirPlay 2 + Bonjour mDNS (_airplay._tcp :7000, _raop._tcp :5000, H.264 :7100)
         airPlayService = AirPlayBonjourService(
             localIp = localIp,
             deviceName = "OmniCast Google TV",
+            onStartMirroring = { w, h, fps ->
+                startNativeHardwareMirror(w, h, fps)
+            },
+            onH264Nal = { nal ->
+                h264Decoder?.pushNalUnit(nal)
+            },
             onPlayUrl = { url -> runOnUiThread { playNativeMedia(url, "video/mp4") } },
             onPhotoBytes = { bytes -> runOnUiThread { showNativePhoto(bytes) } },
             onStop = { runOnUiThread { showStandbyScreen() } }
@@ -95,7 +101,7 @@ class MainActivity : AppCompatActivity() {
             httpPort = 8080,
             httpsPort = 8444,
             onStartH264Mirror = { w, h, fps ->
-                runOnUiThread { startNativeHardwareMirror(w, h, fps) }
+                startNativeHardwareMirror(w, h, fps)
             },
             onH264NalPacket = { nal ->
                 h264Decoder?.pushNalUnit(nal)
@@ -181,7 +187,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         statusBadgeText = TextView(this).apply {
-            text = "● ACTIVO: AirPlay + DLNA + MediaCodec H.264 (<5ms)"
+            text = "● ACTIVO: AirPlay 2 + DLNA + MediaCodec H.264 (<5ms)"
             setTextColor(Color.parseColor("#34D399"))
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
             setTypeface(typeface, Typeface.BOLD)
@@ -216,10 +222,10 @@ class MainActivity : AppCompatActivity() {
             }
         }
         leftCard.addView(createLabel("PROTOCOLOS NATIVOS ACTIVOS EN RED LOCAL (IGUAL QUE AIRSCREEN)", "#38BDF8"))
-        leftCard.addView(createTitle("1. AirPlay + Google Cast + DLNA", 20f))
+        leftCard.addView(createTitle("1. AirPlay 2 + Google Cast + DLNA", 20f))
         leftCard.addView(createBody(
-            "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV (Usa el receptor Cast de hardware con 0 lag).\n\n" +
-            "• iPhone / iPad / Mac (AirPlay Video y Fotos): Detectado automáticamente como 'OmniCast Google TV' (_airplay._tcp puerto 7000).\n\n" +
+            "• Mac / iPhone / iPad (Duplicar Pantalla Nativo): Abre Centro de Control -> Duplicar Pantalla -> Elige 'OmniCast Google TV' (Puertos 7000/5000/7100).\n\n" +
+            "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV.\n\n" +
             "• Windows / Android / iOS (DLNA / UPnP): Detectado en VLC, Galería y 'Transmitir en dispositivo' de Windows (SSDP puerto 1900)."
         ))
 
@@ -258,12 +264,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startNativeHardwareMirror(width: Int, height: Int, fps: Int) {
-        exoPlayer?.stop()
-        exoPlayerView.visibility = View.GONE
-        photoView.visibility = View.GONE
-        standbyDashboard.visibility = View.GONE
-        mirrorSurfaceView.visibility = View.VISIBLE
-
         if (surfaceReady) {
             if (h264Decoder == null) {
                 h264Decoder = HardwareH264Decoder(mirrorSurfaceView.holder.surface)
@@ -271,6 +271,14 @@ class MainActivity : AppCompatActivity() {
             h264Decoder?.start(width, height, fps)
         }
         audioPlayer?.start(48000)
+
+        runOnUiThread {
+            exoPlayer?.stop()
+            exoPlayerView.visibility = View.GONE
+            photoView.visibility = View.GONE
+            standbyDashboard.visibility = View.GONE
+            mirrorSurfaceView.visibility = View.VISIBLE
+        }
     }
 
     private fun playNativeMedia(urlOrPath: String, mime: String) {
