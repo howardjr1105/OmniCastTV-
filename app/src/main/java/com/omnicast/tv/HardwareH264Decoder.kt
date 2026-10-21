@@ -10,14 +10,15 @@ import java.util.concurrent.LinkedBlockingDeque
 import java.util.concurrent.TimeUnit
 
 /**
- * Decodificador H.264/AVC por Hardware directo a SurfaceView (Igual que AirScreen y Moonlight).
- * Elimina por completo el WebView y decodifica NAL units Annex-B en < 4 ms usando el VPU del Google TV.
+ * Decodificador H.264/AVC por Hardware directo a SurfaceView.
+ * Garantiza que el paquete SPS/PPS (Codec Config) nunca se pierda al iniciar la sesión AirPlay.
  */
 class HardwareH264Decoder(private val surface: Surface) {
 
     private var codec: MediaCodec? = null
     @Volatile private var isRunning = false
-    private val nalQueue = LinkedBlockingDeque<ByteArray>(30)
+    private val nalQueue = LinkedBlockingDeque<ByteArray>(180)
+    @Volatile private var cachedConfigNal: ByteArray? = null
     private var inputThread: Thread? = null
     private var outputThread: Thread? = null
 
@@ -28,20 +29,10 @@ class HardwareH264Decoder(private val surface: Surface) {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, width * height)
-                // Prioridad en tiempo real (0 = Realtime)
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
-                setInteger(MediaFormat.KEY_OPERATING_RATE, Short.MAX_VALUE.toInt())
-
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
                 }
-                // Flags de baja latencia específicos de chipsets de Google TV (Amlogic, MediaTek, Qualcomm, Realtek)
-                setInteger("low-latency", 1)
-                setInteger("vendor.low-latency.enable", 1)
-                setInteger("vendor.qti-ext-dec-low-latency.enable", 1)
-                setInteger("vendor.mtk.vdec.lowlatency", 1)
-                setInteger("vendor.rtc-ext-dec-low-latency.enable", 1)
-                setInteger("vendor.amlogic.vdec.lowlatency", 1)
             }
 
             codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
@@ -49,6 +40,9 @@ class HardwareH264Decoder(private val surface: Surface) {
                 start()
             }
             isRunning = true
+
+            // Si ya había llegado un paquete SPS/PPS mientras arrancaba el codec, encolarlo de primero
+            cachedConfigNal?.let { nalQueue.offerFirst(it) }
 
             // Hilo de inyección de NAL units al hardware
             inputThread = Thread({
@@ -58,18 +52,23 @@ class HardwareH264Decoder(private val surface: Surface) {
                 while (isRunning) {
                     try {
                         val nal = nalQueue.poll(15, TimeUnit.MILLISECONDS) ?: continue
-                        val inIdx = localCodec.dequeueInputBuffer(4000)
+                        val inIdx = localCodec.dequeueInputBuffer(10000)
                         if (inIdx >= 0) {
                             val buf = localCodec.getInputBuffer(inIdx)
                             if (buf != null) {
                                 buf.clear()
                                 val len = minOf(nal.size, buf.remaining())
                                 buf.put(nal, 0, len)
-                                // Detectar si el paquete contiene SPS/PPS (NAL type 7 u 8)
                                 val nalType = findFirstNalType(nal)
-                                val flags = if (nalType == 7 || nalType == 8) MediaCodec.BUFFER_FLAG_CODEC_CONFIG else 0
+                                val flags = when (nalType) {
+                                    7, 8 -> MediaCodec.BUFFER_FLAG_CODEC_CONFIG
+                                    5 -> MediaCodec.BUFFER_FLAG_KEY_FRAME
+                                    else -> 0
+                                }
                                 localCodec.queueInputBuffer(inIdx, 0, len, pts, flags)
-                                pts += 16666L
+                                if (nalType != 7 && nalType != 8) {
+                                    pts += 16666L
+                                }
                             }
                         }
                     } catch (e: Exception) {
@@ -78,16 +77,15 @@ class HardwareH264Decoder(private val surface: Surface) {
                 }
             }, "OmniCast-H264-In").apply { start() }
 
-            // Hilo de drenado inmediato a SurfaceView (0 ms presentación)
+            // Hilo de renderizado inmediato a SurfaceView
             outputThread = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val localCodec = codec ?: return@Thread
                 val info = MediaCodec.BufferInfo()
                 while (isRunning) {
                     try {
-                        val outIdx = localCodec.dequeueOutputBuffer(info, 4000)
+                        val outIdx = localCodec.dequeueOutputBuffer(info, 10000)
                         if (outIdx >= 0) {
-                            // Renderizar inmediatamente en el próximo VSYNC del televisor
                             localCodec.releaseOutputBuffer(outIdx, true)
                         }
                     } catch (e: Exception) {
@@ -96,18 +94,27 @@ class HardwareH264Decoder(private val surface: Surface) {
                 }
             }, "OmniCast-H264-Out").apply { start() }
 
-            Log.i("HardwareH264Decoder", "MediaCodec H.264 Low-Latency iniciado ($width x $height @ $fps fps)")
+            Log.i("HardwareH264Decoder", "MediaCodec H.264 iniciado ($width x $height @ $fps fps)")
         } catch (e: Exception) {
             Log.e("HardwareH264Decoder", "Error al iniciar MediaCodec: ${e.message}")
         }
     }
 
     fun pushNalUnit(nalData: ByteArray) {
-        if (!isRunning) return
         val nalType = findFirstNalType(nalData)
-        // Si la cola se llena por una ráfaga Wi-Fi y no es SPS/PPS/IDR, descartar cuadros viejos para mantener 0 lag
-        if (nalQueue.remainingCapacity() == 0 && nalType != 7 && nalType != 8 && nalType != 5) {
-            nalQueue.pollFirst()
+        // Guardar siempre en caché el último SPS/PPS (NAL 7 u 8) aunque el codec aún esté arrancando
+        if (nalType == 7 || nalType == 8) {
+            cachedConfigNal = nalData
+        }
+        if (!isRunning) return
+
+        if (nalQueue.remainingCapacity() == 0) {
+            if (nalType == 7 || nalType == 8 || nalType == 5) {
+                nalQueue.pollLast()
+            } else {
+                // Descartar solo este P-frame entrante sin borrar jamás el SPS/PPS ni el IDR del frente
+                return
+            }
         }
         nalQueue.offerLast(nalData)
     }
