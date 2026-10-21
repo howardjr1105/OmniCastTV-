@@ -7,6 +7,7 @@ import com.dd.plist.NSData
 import com.dd.plist.NSDictionary
 import com.dd.plist.NSNumber
 import com.dd.plist.NSObject
+import com.dd.plist.NSString
 import com.dd.plist.PropertyListParser
 import net.i2p.crypto.eddsa.EdDSAEngine
 import net.i2p.crypto.eddsa.EdDSAPublicKey
@@ -659,20 +660,20 @@ class AirPlayBonjourService(
 
     private fun buildServerInfoBinaryPlist(): ByteArray {
         val root = NSDictionary()
-        root["deviceid"] = macAddress
+        root["deviceid"] = NSString(macAddress)
         root["features"] = NSNumber(130619829911L) // 0x1E5A7FFFF7
-        root["model"] = "AppleTV3,2"
-        root["protovers"] = "1.0"
-        root["srcvers"] = "220.68"
+        root["model"] = NSString("AppleTV3,2")
+        root["protovers"] = NSString("1.0")
+        root["srcvers"] = NSString("220.68")
         root["vv"] = NSNumber(2)
-        root["pi"] = "b08f5a79-db29-4384-b456-a4784d9e6055"
+        root["pi"] = NSString("b08f5a79-db29-4384-b456-a4784d9e6055")
         root["pk"] = NSData(edPublicKeyBytes)
         root["statusFlags"] = NSNumber(68)
         root["keepAliveLowPower"] = NSNumber(1)
         root["keepAliveSendStatsAsBody"] = NSNumber(1)
 
         val display = NSDictionary()
-        display["uuid"] = "e5f7a68d-7b0f-4305-984b-974f677a150b"
+        display["uuid"] = NSString("e5f7a68d-7b0f-4305-984b-974f677a150b")
         display["widthPhysical"] = NSNumber(false)
         display["heightPhysical"] = NSNumber(false)
         display["width"] = NSNumber(1920)
@@ -700,13 +701,13 @@ class AirPlayBonjourService(
 
         val al0 = NSDictionary().apply {
             put("type", NSNumber(100))
-            put("audioType", "default")
+            put("audioType", NSString("default"))
             put("inputLatencyMicros", NSNumber(false))
             put("outputLatencyMicros", NSNumber(false))
         }
         val al1 = NSDictionary().apply {
             put("type", NSNumber(101))
-            put("audioType", "default")
+            put("audioType", NSString("default"))
             put("inputLatencyMicros", NSNumber(false))
             put("outputLatencyMicros", NSNumber(false))
         }
