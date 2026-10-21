@@ -381,6 +381,7 @@ class AirPlayBonjourService(
                                         val ekeyData = (reqPlist["ekey"] as? NSData)?.bytes()
                                         val eivData = (reqPlist["eiv"] as? NSData)?.bytes()
                                         setupEiv = eivData
+                                        logTv("SETUP ekey=${ekeyData?.size ?: -1}B eiv=${eivData?.size ?: -1}B secret=${sharedSecret?.size ?: -1}B")
                                         if (ekeyData != null) {
                                             rawFairPlayAesKey = fairPlay.decryptAesKey(ekeyData)
                                             logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0}B)")
@@ -399,6 +400,7 @@ class AirPlayBonjourService(
                                             when (type) {
                                                 110 -> {
                                                     val streamConnId = (streamDict["streamConnectionID"] as? NSNumber)?.longValue()
+                                                    logTv("SETUP video streamConnectionID=${streamConnId?.let { java.lang.Long.toUnsignedString(it) }} key=${rawFairPlayAesKey != null}")
                                                     if (rawFairPlayAesKey != null && sharedSecret != null) {
                                                         initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, setupEiv, streamConnId)
                                                     }
@@ -586,6 +588,7 @@ class AirPlayBonjourService(
                         }
                     }
                     0 -> {
+                        val encHead = if (frameCounter == 0) payload.copyOf(minOf(8, payload.size)) else null
                         decryptVideoPacket(payload)
                         var offset = 0
                         var validNals = 0
@@ -610,7 +613,8 @@ class AirPlayBonjourService(
                                 logTv("Primer cuadro H.264 decodificado (NAL=$firstNalType, ${payload.size}B)")
                             }
                         } else if (frameCounter == 0) {
-                            logTv("Error: Paquete H.264 sin cabeceras AVCC válidas (${payload.size}B)")
+                            logTv("Error: Paquete H.264 sin cabeceras AVCC válidas (${payload.size}B) cipher=${activeVideoCipher != null} " +
+                                "enc=${encHead?.toHex()} dec=${payload.copyOf(minOf(8, payload.size)).toHex()}")
                         }
                     }
                 }
@@ -622,6 +626,8 @@ class AirPlayBonjourService(
             onStop()
         }
     }
+
+    private fun ByteArray.toHex() = joinToString("") { "%02x".format(it) }
 
     private fun convertAvcCToAnnexB(avcC: ByteArray): ByteArray {
         return try {
