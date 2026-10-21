@@ -693,7 +693,9 @@ class AirPlayBonjourService(
 
         val root = NSDictionary()
         root["deviceid"] = NSString(macAddress)
-        root["features"] = NSNumber(130367487991L)
+        // Igual que el TXT de Bonjour (0x5A7FFFF7,0x1E): los bits 18-21 (AudioFormats) son obligatorios,
+        // sin ellos macOS no crea el audio del receptor y cancela la duplicación a los ~60 s
+        root["features"] = NSNumber(0x1E5A7FFFF7L)
         root["model"] = NSString("AppleTV3,2")
         root["protovers"] = NSString("1.0")
         root["srcvers"] = NSString("220.68")

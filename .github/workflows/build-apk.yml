@@ -31,7 +31,18 @@ jobs:
         with:
           gradle-version: "8.4"
 
+      - name: Restaurar keystore fija de firma
+        env:
+          OMNICAST_KEYSTORE_BASE64: ${{ secrets.OMNICAST_KEYSTORE_BASE64 }}
+        run: |
+          # Sin keystore fija cada run firmaría con una clave debug distinta y el TV exigiría desinstalar
+          if [ -z "$OMNICAST_KEYSTORE_BASE64" ]; then echo "::error::Falta el secreto OMNICAST_KEYSTORE_BASE64"; exit 1; fi
+          echo "$OMNICAST_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/omnicast.p12"
+          echo "OMNICAST_KEYSTORE=$RUNNER_TEMP/omnicast.p12" >> "$GITHUB_ENV"
+
       - name: Compilar APK Release y Debug (Pre-firmados para Google TV)
+        env:
+          OMNICAST_KEYSTORE_PASSWORD: ${{ secrets.OMNICAST_KEYSTORE_PASSWORD }}
         run: |
           if [ -f "OmniCastTV/settings.gradle.kts" ]; then cd OmniCastTV; fi
           gradle assembleRelease assembleDebug

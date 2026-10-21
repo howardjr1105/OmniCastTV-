@@ -21,10 +21,29 @@ android {
         versionName = "2.6.0-Native"
     }
 
+    // Keystore fija (secreto de CI) para que cada versión se instale encima de la anterior sin desinstalar.
+    // Sin OMNICAST_KEYSTORE (build local) se usa la firma debug de la máquina.
+    val omnicastKeystore = System.getenv("OMNICAST_KEYSTORE")?.let { file(it) }?.takeIf { it.exists() }
+    signingConfigs {
+        if (omnicastKeystore != null) {
+            create("omnicast") {
+                storeFile = omnicastKeystore
+                storeType = "pkcs12"
+                storePassword = System.getenv("OMNICAST_KEYSTORE_PASSWORD")
+                keyAlias = "omnicast"
+                keyPassword = System.getenv("OMNICAST_KEYSTORE_PASSWORD")
+            }
+        }
+    }
+    val appSigning = signingConfigs.findByName("omnicast") ?: signingConfigs.getByName("debug")
+
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("debug")
+            signingConfig = appSigning
+        }
+        debug {
+            signingConfig = appSigning
         }
     }
     compileOptions {
