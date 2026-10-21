@@ -17,8 +17,8 @@ android {
         applicationId = "com.omnicast.tv"
         minSdk = 24
         targetSdk = 34
-        versionCode = 9
-        versionName = "2.5.0-Native"
+        versionCode = 10
+        versionName = "2.6.0-Native"
     }
 
     buildTypes {
@@ -42,7 +42,7 @@ android {
 }
 
 // Tarea automática de Gradle que descarga por HTTPS directo (sin usar git ni credenciales)
-// las tablas FairPlay SAP v2.5 de serezhka/java-airplay-lib e inyecta el código en com.omnicast.tv.playfair
+// todas las clases y tablas S-Box de FairPlay SAP v2.5 (FairPlay, OmgHax, OmgHaxConst, HandGarble, ModifiedMD5, SapHash)
 val injectFairPlayEngine by tasks.registering {
     doLast {
         val targetJavaDir = file("src/main/java/com/omnicast/tv/playfair")
@@ -51,15 +51,16 @@ val injectFairPlayEngine by tasks.registering {
         targetAssetsDir.mkdirs()
 
         val fairPlayFile = File(targetJavaDir, "FairPlay.java")
-        if (!fairPlayFile.exists()) {
+        val omgHaxConstFile = File(targetJavaDir, "OmgHaxConst.java")
+        if (!fairPlayFile.exists() || !omgHaxConstFile.exists()) {
             val urls = listOf(
                 "https://codeload.github.com/serezhka/java-airplay-lib/zip/refs/heads/master",
-                "https://codeload.github.com/serezhka/java-airplay-lib/zip/refs/heads/main",
                 "https://github.com/serezhka/java-airplay-lib/archive/HEAD.zip",
                 "https://jitpack.io/com/github/serezhka/java-airplay-lib/1.0.5/java-airplay-lib-1.0.5-sources.jar"
             )
 
-            val neededClasses = setOf("FairPlay.java", "PlayFair.java", "ModifiedMd5.java", "HandGarble.java", "OmgHax.java")
+            // Prefijos en minúsculas para capturar FairPlay, OmgHax, OmgHaxConst, HandGarble, ModifiedMD5, SapHash y cualquier *Const
+            val neededPrefixes = listOf("fairplay", "playfair", "omghax", "handgarble", "modifiedmd5", "saphash")
             var copiedCount = 0
 
             for (urlStr in urls) {
@@ -76,14 +77,17 @@ val injectFairPlayEngine by tasks.registering {
                         ZipInputStream(ByteArrayInputStream(zipBytes)).use { zis ->
                             var entry = zis.nextEntry
                             while (entry != null) {
-                                if (!entry.isDirectory) {
+                                if (!entry.isDirectory && !entry.name.contains("/test/")) {
                                     val fileName = entry.name.substringAfterLast("/")
-                                    if (fileName in neededClasses) {
+                                    val lowerName = fileName.lowercase()
+                                    if (fileName.endsWith(".java") && neededPrefixes.any { lowerName.startsWith(it) }) {
                                         val className = fileName.substringBeforeLast(".")
                                         var content = zis.readBytes().toString(Charsets.UTF_8)
-                                        content = content.replace(Regex("(?m)^package\\s+[^;]+;"), "package com.omnicast.tv.playfair;")
+
+                                        // Reemplazar paquete tanto en `package ...` como en `import static com.github.serezhka.jap2lib.OmgHaxConst.*;`
+                                        content = content.replace("com.github.serezhka.jap2lib", "com.omnicast.tv.playfair")
+                                        content = content.replace("io.github.serezhka.jap2lib", "com.omnicast.tv.playfair")
                                         content = content.replace(Regex("(?m)^import\\s+lombok[^;]+;\\s*$"), "")
-                                        content = content.replace(Regex("(?m)^import\\s+(com|io)\\.github\\.serezhka[^;]+;\\s*$"), "")
                                         content = content.replace("@Slf4j", "")
 
                                         if (content.contains("log.") && !content.contains("LoggerFactory.getLogger")) {
@@ -100,7 +104,7 @@ val injectFairPlayEngine by tasks.registering {
                                         File(targetJavaDir, fileName).writeText(content, Charsets.UTF_8)
                                         copiedCount++
                                         println(">>> [OmniCast] Inyectado en com.omnicast.tv.playfair: $fileName")
-                                    } else if (fileName == "info.plist") {
+                                    } else if (lowerName == "info.plist") {
                                         val plistBytes = zis.readBytes()
                                         File(targetAssetsDir, "airplay_info.plist").writeBytes(plistBytes)
                                         println(">>> [OmniCast] Inyectado asset binario: airplay_info.plist (${plistBytes.size} bytes)")
@@ -109,13 +113,13 @@ val injectFairPlayEngine by tasks.registering {
                                 entry = zis.nextEntry
                             }
                         }
-                        if (copiedCount >= 5) break
+                        if (copiedCount >= 6) break
                     }
                 } catch (e: Exception) {
                     println(">>> [OmniCast] Aviso intentando $urlStr: ${e.message}")
                 }
             }
-            println(">>> [OmniCast] Clases FairPlay listas: $copiedCount de 5")
+            println(">>> [OmniCast] Total clases FairPlay inyectadas: $copiedCount")
         }
     }
 }

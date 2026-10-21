@@ -443,6 +443,7 @@ class MainActivity : AppCompatActivity() {
         return "192.168.0.14"
     }
 
+    @Suppress("DEPRECATION")
     private fun hideSystemUI() {
         window.decorView.systemUiVisibility = (
             View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
