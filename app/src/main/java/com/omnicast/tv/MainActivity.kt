@@ -27,11 +27,10 @@ import androidx.media3.ui.PlayerView
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 
-/**
- * Actividad 100% Nativa para Google TV / Android TV (CERO WebView).
- * Renderiza directamente sobre SurfaceView por Hardware (MediaCodec H.264 Low-Latency + ExoPlayer + AirPlay 2 + DLNA).
- */
 class MainActivity : AppCompatActivity() {
 
     private lateinit var rootLayout: FrameLayout
@@ -40,6 +39,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var photoView: ImageView
     private lateinit var standbyDashboard: LinearLayout
     private lateinit var statusBadgeText: TextView
+    private lateinit var liveLogTextView: TextView
+
+    private val logLines = ArrayDeque<String>(8)
+    private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private var h264Decoder: HardwareH264Decoder? = null
     private var audioPlayer: LowLatencyAudioPlayer? = null
@@ -66,23 +69,23 @@ class MainActivity : AppCompatActivity() {
 
         val localIp = getLocalIpAddress()
 
-        // Construir interfaz 100% nativa en Kotlin (Cero WebView)
         buildNativeTvUi(localIp)
+        appendTvLog("Motor nativo iniciado en $localIp")
 
-        // Inicializar ExoPlayer nativo por hardware
         exoPlayer = ExoPlayer.Builder(this).build()
         exoPlayerView.player = exoPlayer
 
-        // Inicializar reproductor de audio PCM de baja latencia
         audioPlayer = LowLatencyAudioPlayer()
 
         // 1. Iniciar Demonio DLNA / UPnP MediaRenderer (Puerto 1900 UDP)
         dlnaService = DlnaSsdpService(localIp, 8080, "OmniCast Google TV").also { it.start() }
 
-        // 2. Iniciar Demonio AirPlay 2 + Bonjour mDNS (_airplay._tcp :7000, _raop._tcp :5000, H.264 :7100)
+        // 2. Iniciar Demonio AirPlay 2 + FairPlay SAP v2.5 + Bonjour mDNS
         airPlayService = AirPlayBonjourService(
+            context = applicationContext,
             localIp = localIp,
             deviceName = "OmniCast Google TV",
+            onLogEvent = { msg -> appendTvLog(msg) },
             onStartMirroring = { w, h, fps ->
                 startNativeHardwareMirror(w, h, fps)
             },
@@ -119,12 +122,22 @@ class MainActivity : AppCompatActivity() {
         ).also { it.start() }
     }
 
+    private fun appendTvLog(message: String) {
+        val stamp = timeFormat.format(Date())
+        runOnUiThread {
+            if (logLines.size >= 6) logLines.removeFirst()
+            logLines.addLast("[$stamp] $message")
+            if (::liveLogTextView.isInitialized) {
+                liveLogTextView.text = logLines.joinToString("\n")
+            }
+        }
+    }
+
     private fun buildNativeTvUi(localIp: String) {
         rootLayout = FrameLayout(this).apply {
             setBackgroundColor(Color.parseColor("#070B14"))
         }
 
-        // 1. SurfaceView nativo directo al Hardware Composer del Google TV (MediaCodec H.264)
         mirrorSurfaceView = SurfaceView(this).apply {
             holder.addCallback(object : SurfaceHolder.Callback {
                 override fun surfaceCreated(holder: SurfaceHolder) {
@@ -142,7 +155,6 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT
         ))
 
-        // 2. ExoPlayer View nativo (para AirPlay Video, DLNA y Videos 4K locales)
         exoPlayerView = PlayerView(this).apply {
             useController = true
             visibility = View.GONE
@@ -153,7 +165,6 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT
         ))
 
-        // 3. ImageView nativo (para AirPlay Fotos y Galería)
         photoView = ImageView(this).apply {
             scaleType = ImageView.ScaleType.FIT_CENTER
             visibility = View.GONE
@@ -164,34 +175,32 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT
         ))
 
-        // 4. Dashboard Nativo de Google TV (Modo Espera)
         standbyDashboard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(48), dp(36), dp(48), dp(36))
+            setPadding(dp(44), dp(30), dp(44), dp(30))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
                 intArrayOf(Color.parseColor("#090E1A"), Color.parseColor("#111827"), Color.parseColor("#1E1B4B"))
             )
         }
 
-        // Encabezado
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
         }
         val titleText = TextView(this).apply {
-            text = "OmniCast Native TV · Motor Hardware Directo"
+            text = "OmniCast Native TV v2.4 · AirPlay 2 + FairPlay SAP"
             setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 26f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
             setTypeface(typeface, Typeface.BOLD)
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
         statusBadgeText = TextView(this).apply {
-            text = "● ACTIVO: AirPlay 2 + DLNA + MediaCodec H.264 (<5ms)"
+            text = "● ACTIVO: AirPlay 2 + FairPlay + DLNA + MediaCodec"
             setTextColor(Color.parseColor("#34D399"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(16), dp(8), dp(16), dp(8))
+            setPadding(dp(14), dp(6), dp(14), dp(6))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#1410B981"))
                 setStroke(dp(1), Color.parseColor("#34D399"))
@@ -202,7 +211,6 @@ class MainActivity : AppCompatActivity() {
         headerRow.addView(statusBadgeText)
         standbyDashboard.addView(headerRow)
 
-        // Tarjetas centrales de protocolos nativos
         val cardsContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             layoutParams = LinearLayout.LayoutParams(
@@ -210,48 +218,59 @@ class MainActivity : AppCompatActivity() {
                 0,
                 1f
             ).apply {
-                topMargin = dp(24)
-                bottomMargin = dp(24)
+                topMargin = dp(18)
+                bottomMargin = dp(14)
             }
         }
 
-        // Columna Izquierda: Protocolos Nativos sin abrir navegador
         val leftCard = createCard().apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                rightMargin = dp(16)
+                rightMargin = dp(12)
             }
         }
-        leftCard.addView(createLabel("PROTOCOLOS NATIVOS ACTIVOS EN RED LOCAL (IGUAL QUE AIRSCREEN)", "#38BDF8"))
-        leftCard.addView(createTitle("1. AirPlay 2 + Google Cast + DLNA", 20f))
+        leftCard.addView(createLabel("PROTOCOLOS NATIVOS ACTIVOS (AIRPLAY 2 + CAST + DLNA)", "#38BDF8"))
+        leftCard.addView(createTitle("1. Duplicar Pantalla desde Mac / iPhone / Android", 18f))
         leftCard.addView(createBody(
-            "• Mac / iPhone / iPad (Duplicar Pantalla Nativo): Abre Centro de Control -> Duplicar Pantalla -> Elige 'OmniCast Google TV' (Puertos 7000/5000/7100).\n\n" +
+            "• Mac / iPhone / iPad (AirPlay 2): Centro de Control -> Duplicar Pantalla -> 'OmniCast Google TV' (Puertos 7000/5000/7100 + FairPlay SAP v2.5).\n\n" +
             "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV.\n\n" +
-            "• Windows / Android / iOS (DLNA / UPnP): Detectado en VLC, Galería y 'Transmitir en dispositivo' de Windows (SSDP puerto 1900)."
+            "• Windows / Android / iOS (DLNA): Detectado en VLC y Galería (SSDP 1900)."
         ))
 
-        // Columna Derecha: Motor H.264 Hardware Directo a SurfaceView
         val rightCard = createCard().apply {
             layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                leftMargin = dp(16)
+                leftMargin = dp(12)
             }
         }
-        rightCard.addView(createLabel("DUPLICACIÓN DIRECTA A CHIP MEDIACODEC (SIN WEBVIEW)", "#34D399"))
-        rightCard.addView(createTitle("2. Stream Binario H.264 -> SurfaceView", 20f))
-        rightCard.addView(createBody(
-            "Para duplicar pantalla desde navegador enviando H.264 puro directo al decodificador de hardware del TV:"
-        ))
-        rightCard.addView(createUrlBox("Enlace Directo HTTP (Puerto 8080):", "http://$localIp:8080", "#34D399"))
-        rightCard.addView(createUrlBox("Enlace Seguro HTTPS (Puerto 8444):", "https://$localIp:8444", "#38BDF8"))
+        rightCard.addView(createLabel("CONSOLA DE DIAGNÓSTICO AIRPLAY EN TIEMPO REAL", "#34D399"))
+        rightCard.addView(createTitle("2. Estado de Conexión y Enlaces Directos", 18f))
+        rightCard.addView(createUrlBox("HTTP (:8080) / HTTPS (:8444):", "http://$localIp:8080  |  https://$localIp:8444", "#34D399"))
+
+        liveLogTextView = TextView(this).apply {
+            text = "Esperando conexión AirPlay desde Mac/iPhone..."
+            setTextColor(Color.parseColor("#38BDF8"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
+            setTypeface(Typeface.MONOSPACE, Typeface.NORMAL)
+            setPadding(dp(12), dp(10), dp(12), dp(10))
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT
+            ).apply { topMargin = dp(10) }
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#030712"))
+                setStroke(dp(1), Color.parseColor("#1E293B"))
+                cornerRadius = dp(10).toFloat()
+            }
+        }
+        rightCard.addView(liveLogTextView)
 
         cardsContainer.addView(leftCard)
         cardsContainer.addView(rightCard)
         standbyDashboard.addView(cardsContainer)
 
-        // Pie de página
         val footerText = TextView(this).apply {
-            text = "Renderizador: Android SurfaceView + MediaCodec Low-Latency (0 B-Frames) · Presiona [BACK] o [OK] en el control del TV para detener una transmisión"
+            text = "Renderizador: Android SurfaceView + MediaCodec Low-Latency · Presiona [BACK] en el control del TV para detener una transmisión"
             setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
         }
         standbyDashboard.addView(footerText)
 
@@ -334,11 +353,11 @@ class MainActivity : AppCompatActivity() {
     private fun createCard(): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(24), dp(22), dp(24), dp(22))
+            setPadding(dp(20), dp(18), dp(20), dp(18))
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#D9111827"))
                 setStroke(dp(1), Color.parseColor("#1F2937"))
-                cornerRadius = dp(20).toFloat()
+                cornerRadius = dp(18).toFloat()
             }
         }
     }
@@ -347,7 +366,7 @@ class MainActivity : AppCompatActivity() {
         return TextView(this).apply {
             text = textStr
             setTextColor(Color.parseColor(colorHex))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             setTypeface(typeface, Typeface.BOLD)
         }
     }
@@ -358,7 +377,7 @@ class MainActivity : AppCompatActivity() {
             setTextColor(Color.WHITE)
             setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
             setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, dp(4), 0, dp(8))
+            setPadding(0, dp(3), 0, dp(6))
         }
     }
 
@@ -366,33 +385,33 @@ class MainActivity : AppCompatActivity() {
         return TextView(this).apply {
             text = textStr
             setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f)
-            setLineSpacing(dp(3).toFloat(), 1f)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
+            setLineSpacing(dp(2).toFloat(), 1f)
         }
     }
 
     private fun createUrlBox(label: String, url: String, colorHex: String): LinearLayout {
         return LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(14), dp(10), dp(14), dp(10))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(10) }
+            ).apply { topMargin = dp(6) }
             background = GradientDrawable().apply {
                 setColor(Color.parseColor("#030712"))
                 setStroke(dp(1), Color.parseColor("#374151"))
-                cornerRadius = dp(12).toFloat()
+                cornerRadius = dp(10).toFloat()
             }
             addView(TextView(context).apply {
                 text = label
                 setTextColor(Color.parseColor("#94A3B8"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
             })
             addView(TextView(context).apply {
                 text = url
                 setTextColor(Color.parseColor(colorHex))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 19f)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
                 setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
             })
         }

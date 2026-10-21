@@ -1,5 +1,6 @@
 package com.omnicast.tv
 
+import android.content.Context
 import android.util.Log
 import com.dd.plist.BinaryPropertyListWriter
 import com.dd.plist.NSArray
@@ -10,16 +11,18 @@ import com.dd.plist.NSObject
 import com.dd.plist.NSString
 import com.dd.plist.PropertyListParser
 import net.i2p.crypto.eddsa.EdDSAEngine
+import net.i2p.crypto.eddsa.EdDSAPrivateKey
 import net.i2p.crypto.eddsa.EdDSAPublicKey
-import net.i2p.crypto.eddsa.KeyPairGenerator
 import net.i2p.crypto.eddsa.spec.EdDSANamedCurveTable
+import net.i2p.crypto.eddsa.spec.EdDSAPrivateKeySpec
+import net.i2p.crypto.eddsa.spec.EdDSAPublicKeySpec
 import org.whispersystems.curve25519.Curve25519
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.lang.reflect.Modifier
+import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -36,18 +39,15 @@ import javax.jmdns.JmDNS
 import javax.jmdns.ServiceInfo
 
 /**
- * Receptor AirPlay 2 Completo para macOS / iOS (Screen Mirroring H.264 60 FPS + Video + Fotos).
- * Implementa:
- * - Bonjour _airplay._tcp.local. (:7000) y _raop._tcp.local. (:5000) con llave pública Ed25519 sincronizada.
- * - GET /info en formato Apple Binary Plist (bplist00) con descriptores de pantalla 1080p@60fps.
- * - POST /pair-setup y /pair-verify con Ed25519 + Curve25519 ECDH + AES-128-CTR.
- * - POST /fp-setup (FairPlay SAP v2.5) y descifrado de llave de sesión ekey + streamConnectionID.
- * - SETUP RTSP de 2 etapas (eventPort 7101, timingPort 7102, videoDataPort 7100, audio 7103/7104).
- * - Receptor de paquetes H.264 en puerto TCP 7100 con conversión AVCC -> Annex-B directo a MediaCodec.
+ * Receptor AirPlay 2 Nativo para macOS / iOS (Screen Mirroring H.264 60 FPS + Video + Fotos).
+ * Usa las tablas reales FairPlay SAP v2.5 (FairPlay / PlayFair inyectadas por Gradle en preBuild),
+ * Curve25519.JAVA (sin errores JNI en Android), NTP UDP responder en puerto 7102 y log en pantalla.
  */
 class AirPlayBonjourService(
+    private val context: Context,
     private val localIp: String,
     private val deviceName: String = "OmniCast Google TV",
+    private val onLogEvent: (String) -> Unit,
     private val onStartMirroring: (Int, Int, Int) -> Unit,
     private val onH264Nal: (ByteArray) -> Unit,
     private val onPlayUrl: (String) -> Unit,
@@ -66,18 +66,40 @@ class AirPlayBonjourService(
     private var audioDataUdp7103: DatagramSocket? = null
     private var audioCtrlUdp7104: DatagramSocket? = null
 
-    // Par de llaves Ed25519 del receptor (la llave pública se anuncia en Bonjour 'pk' y en '/info')
-    private val edKeyPair = KeyPairGenerator().generateKeyPair()
-    private val edPublicKeyBytes: ByteArray = (edKeyPair.public as EdDSAPublicKey).abyte
-    private val edPublicKeyHex: String = edPublicKeyBytes.joinToString("") { "%02x".format(it) }
+    // Semilla determinista Ed25519 para que la llave pública 'pk' sea siempre consistente con Bonjour y /info
+    private val edCurveSpec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
+    private val edPrivateKey: EdDSAPrivateKey
+    private val edPublicKey: EdDSAPublicKey
+    private val edPublicKeyBytes: ByteArray
+    private val edPublicKeyHex: String
+
+    init {
+        val seed = MessageDigest.getInstance("SHA-256").digest("OmniCastGoogleTV-Ed25519-Seed".toByteArray())
+        val privSpec = EdDSAPrivateKeySpec(seed, edCurveSpec)
+        edPrivateKey = EdDSAPrivateKey(privSpec)
+        val pubSpec = EdDSAPublicKeySpec(privSpec.a, edCurveSpec)
+        edPublicKey = EdDSAPublicKey(pubSpec)
+        edPublicKeyBytes = edPublicKey.abyte
+        edPublicKeyHex = edPublicKeyBytes.joinToString("") { "%02x".format(it) }
+    }
 
     private val macAddress = "AA:BB:CC:11:22:33"
     private val macCompact = "AABBCC112233"
 
-    // Estado criptográfico de la sesión activa de Screen Mirroring
+    // Estado de sesión compartido (preservado incluso si macOS usa conexiones TCP separadas en :7000 y :5000)
+    private val fairPlay = FairPlay()
+    @Volatile private var sharedSecret: ByteArray? = null
+    @Volatile private var pairCipher: Cipher? = null
+    @Volatile private var rawFairPlayAesKey: ByteArray? = null
+    @Volatile private var setupEiv: ByteArray? = null
     @Volatile private var activeVideoCipher: Cipher? = null
     private val ogBlock = ByteArray(16)
     @Volatile private var nextDecryptCount = 0
+
+    private fun logTv(msg: String) {
+        Log.i("AirPlayService", msg)
+        onLogEvent(msg)
+    }
 
     fun start() {
         if (isRunning) return
@@ -139,9 +161,9 @@ class AirPlayBonjourService(
                     raopProps
                 )
                 jmdns?.registerService(raopInfo)
-                Log.i("AirPlayService", "Bonjour registrado en $localIp (:7000 y :5000) con pk=$edPublicKeyHex")
-            } catch (e: Exception) {
-                Log.e("AirPlayService", "Error mDNS: ${e.message}")
+                logTv("Bonjour activo en $localIp (:7000 AirPlay / :5000 RAOP)")
+            } catch (e: Throwable) {
+                logTv("Error mDNS: ${e.message}")
             }
         }
 
@@ -149,50 +171,103 @@ class AirPlayBonjourService(
         startRtspListener(7000) { airplaySocket7000 = it }
         startRtspListener(5000) { raopSocket5000 = it }
 
-        // 3. Abrir puertos auxiliares de sesión (7101 Eventos TCP y 7102..7104 UDP)
+        // 3. Puerto 7101 TCP (Event Channel requerido por macOS tras SETUP)
         executor.execute {
             try {
                 videoEventSocket7101 = ServerSocket(7101).apply { reuseAddress = true }
                 while (isRunning) {
                     val evClient = videoEventSocket7101?.accept() ?: break
+                    logTv("Canal de eventos AirPlay (:7101) conectado")
                     executor.execute {
                         try {
                             val buf = ByteArray(1024)
                             while (isRunning && !evClient.isClosed) {
                                 if (evClient.getInputStream().read(buf) == -1) break
                             }
-                        } catch (_: Exception) {
+                        } catch (_: Throwable) {
                         } finally {
-                            try { evClient.close() } catch (_: Exception) {}
+                            try { evClient.close() } catch (_: Throwable) {}
                         }
                     }
                 }
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
+        }
+
+        // 4. Puerto 7102 UDP (Servidor NTP Timing requerido por macOS para sincronizar reloj de video)
+        executor.execute {
+            try {
+                timingUdp7102 = DatagramSocket(7102).apply { reuseAddress = true }
+                val buf = ByteArray(64)
+                while (isRunning) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    timingUdp7102?.receive(pkt) ?: break
+                    if (pkt.length >= 32 && (buf[0].toInt() and 0xFF) == 0x80 && (buf[1].toInt() and 0xFF) == 0xD2) {
+                        val reply = buildNtpReplyPacket(buf)
+                        timingUdp7102?.send(DatagramPacket(reply, reply.size, pkt.address, pkt.port))
+                    }
+                }
+            } catch (_: Throwable) {}
         }
 
         executor.execute {
             try {
-                timingUdp7102 = DatagramSocket(7102).apply { reuseAddress = true }
                 audioDataUdp7103 = DatagramSocket(7103).apply { reuseAddress = true }
                 audioCtrlUdp7104 = DatagramSocket(7104).apply { reuseAddress = true }
-            } catch (_: Exception) {}
+            } catch (_: Throwable) {}
         }
 
-        // 4. Servidor TCP de Duplicación de Pantalla H.264 en puerto 7100
+        // 5. Servidor TCP de Duplicación de Pantalla H.264 en puerto 7100
         executor.execute {
             try {
                 videoDataSocket7100 = ServerSocket(7100).apply {
                     reuseAddress = true
-                    receiveBufferSize = 524288
+                    receiveBufferSize = 1048576
                 }
                 while (isRunning) {
                     val mirrorClient = videoDataSocket7100?.accept() ?: break
                     executor.execute { handleMirroringVideoStream(mirrorClient) }
                 }
-            } catch (e: Exception) {
-                Log.e("AirPlayService", "Error puerto video 7100: ${e.message}")
+            } catch (e: Throwable) {
+                logTv("Error puerto video 7100: ${e.message}")
             }
         }
+    }
+
+    private fun buildNtpReplyPacket(req: ByteArray): ByteArray {
+        val reply = ByteArray(32)
+        reply[0] = 0x80.toByte()
+        reply[1] = 0xD3.toByte()
+        reply[2] = req[2]
+        reply[3] = 0x07
+        // Copiar Transmit Timestamp del cliente (bytes 24..31) al Origin Timestamp (bytes 8..15)
+        System.arraycopy(req, 24, reply, 8, 8)
+        val ntpNow = currentNtpTimestamp()
+        ByteBuffer.wrap(reply, 16, 8).order(ByteOrder.BIG_ENDIAN).putLong(ntpNow)
+        ByteBuffer.wrap(reply, 24, 8).order(ByteOrder.BIG_ENDIAN).putLong(ntpNow)
+        return reply
+    }
+
+    private fun sendNtpRequestToClient(clientIp: InetAddress, clientTimingPort: Int) {
+        if (clientTimingPort <= 0) return
+        executor.execute {
+            try {
+                val pkt = ByteArray(32)
+                pkt[0] = 0x80.toByte()
+                pkt[1] = 0xD2.toByte()
+                pkt[2] = 0x00
+                pkt[3] = 0x07
+                val ntpNow = currentNtpTimestamp()
+                ByteBuffer.wrap(pkt, 24, 8).order(ByteOrder.BIG_ENDIAN).putLong(ntpNow)
+                timingUdp7102?.send(DatagramPacket(pkt, pkt.size, clientIp, clientTimingPort))
+            } catch (_: Throwable) {}
+        }
+    }
+
+    private fun currentNtpTimestamp(): Long {
+        val millis = System.currentTimeMillis()
+        val seconds = (millis / 1000L) + 2208988800L
+        val fraction = ((millis % 1000L) * 0x100000000L) / 1000L
+        return (seconds shl 32) or (fraction and 0xFFFFFFFFL)
     }
 
     private fun startRtspListener(port: Int, onSocketCreated: (ServerSocket) -> Unit) {
@@ -202,27 +277,17 @@ class AirPlayBonjourService(
                 onSocketCreated(server)
                 while (isRunning) {
                     val client = server.accept() ?: break
-                    executor.execute { handleAirPlayRtspClient(client) }
+                    executor.execute { handleAirPlayRtspClient(client, port) }
                 }
-            } catch (e: Exception) {
-                Log.e("AirPlayService", "Error en puerto RTSP $port: ${e.message}")
+            } catch (e: Throwable) {
+                logTv("Error en puerto RTSP $port: ${e.message}")
             }
         }
     }
 
-    private fun handleAirPlayRtspClient(socket: Socket) {
-        var sharedSecret: ByteArray? = null
-        var pairCipher: Cipher? = null
-        var fpMessage3: ByteArray? = null
-        var rawFairPlayAesKey: ByteArray? = null
-        var setupEiv: ByteArray? = null
-
-        val fairPlayHelper: Any? = try {
-            val cls = Class.forName("com.omnicast.tv.playfair.FairPlay")
-            cls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
-        } catch (_: Exception) {
-            null
-        }
+    private fun handleAirPlayRtspClient(socket: Socket, localPort: Int) {
+        val remoteIp = socket.inetAddress.hostAddress ?: "Mac"
+        logTv("Conexión entrante de $remoteIp en puerto :$localPort")
 
         try {
             socket.tcpNoDelay = true
@@ -257,37 +322,36 @@ class AirPlayBonjourService(
                 }
 
                 val cseq = headers["cseq"]
-                Log.i("AirPlayRTSP", "RTSP Request: $method $path (len=$contentLen, CSeq=$cseq)")
+                if (path != "/feedback") {
+                    logTv("RTSP :$localPort -> $method $path (len=$contentLen, CSeq=${cseq ?: "-"})")
+                }
 
                 when {
-                    // 1. GET /info -> Binary Plist con capacidades 1080p@60fps y llave Ed25519
+                    // 1. GET /info -> Descriptor Binary Plist de Apple TV con nuestra llave pública Ed25519
                     path.startsWith("/info") || path == "/server-info" -> {
                         val bplist = buildServerInfoBinaryPlist()
                         sendResponse(output, "200 OK", "application/x-apple-binary-plist", bplist, cseq)
                     }
 
-                    // 2. POST /pair-setup -> Retorna nuestra llave pública Ed25519 de 32 bytes
+                    // 2. POST /pair-setup -> Llave pública Ed25519 (32 bytes)
                     path == "/pair-setup" -> {
                         sendResponse(output, "200 OK", "application/octet-stream", edPublicKeyBytes, cseq)
                     }
 
-                    // 3. POST /pair-verify -> Handshake Curve25519 ECDH + Ed25519 + AES-128-CTR
+                    // 3. POST /pair-verify -> Handshake Curve25519.JAVA + Ed25519 + AES-128-CTR
                     path == "/pair-verify" && body.size >= 68 -> {
                         val flag = body[0].toInt()
                         if (flag > 0) {
                             val clientCurvePub = body.copyOfRange(4, 36)
-                            val curve25519 = Curve25519.getInstance(Curve25519.BEST)
+                            // IMPORTANTE: Curve25519.JAVA usa implementación 100% Java (no requiere JNI .so en Android)
+                            val curve25519 = Curve25519.getInstance(Curve25519.JAVA)
                             val curveKeyPair = curve25519.generateKeyPair()
                             val serverCurvePub = curveKeyPair.publicKey
                             val secret = curve25519.calculateAgreement(clientCurvePub, curveKeyPair.privateKey)
                             sharedSecret = secret
 
-                            val edEngine = EdDSAEngine(
-                                MessageDigest.getInstance(
-                                    EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519).hashAlgorithm
-                                )
-                            )
-                            edEngine.initSign(edKeyPair.private)
+                            val edEngine = EdDSAEngine(MessageDigest.getInstance(edCurveSpec.hashAlgorithm))
+                            edEngine.initSign(edPrivateKey)
                             edEngine.update(serverCurvePub)
                             edEngine.update(clientCurvePub)
                             val signature = edEngine.sign()
@@ -302,68 +366,65 @@ class AirPlayBonjourService(
                             sha512.update(secret)
                             val aesIv = sha512.digest().copyOfRange(0, 16)
 
-                            pairCipher = Cipher.getInstance("AES/CTR/NoPadding").apply {
+                            val cipher = Cipher.getInstance("AES/CTR/NoPadding").apply {
                                 init(Cipher.ENCRYPT_MODE, SecretKeySpec(aesKey, "AES"), IvParameterSpec(aesIv))
                             }
-                            val encryptedSig = pairCipher!!.update(signature)
+                            pairCipher = cipher
+                            val encryptedSig = cipher.update(signature)
 
                             val resp = ByteArray(96)
                             System.arraycopy(serverCurvePub, 0, resp, 0, 32)
                             System.arraycopy(encryptedSig, 0, resp, 32, 64)
+                            logTv("pair-verify [1/2] completado (X25519 + Ed25519)")
                             sendResponse(output, "200 OK", "application/octet-stream", resp, cseq)
                         } else {
-                            // Fase 2 de pair-verify
                             val clientEncSig = body.copyOfRange(4, 68)
-                            pairCipher?.update(clientEncSig)
+                            pairCipher?.doFinal(clientEncSig)
+                            logTv("pair-verify [2/2] verificado con éxito")
                             sendResponse(output, "200 OK", "application/octet-stream", ByteArray(0), cseq)
                         }
                     }
 
-                    // 4. POST /fp-setup -> Handshake FairPlay SAP v2.5
+                    // 4. POST /fp-setup -> Handshake FairPlay SAP v2.5 real usando las S-Boxes de FairPlay.java
                     path == "/fp-setup" && body.isNotEmpty() -> {
-                        if (body.size == 164) {
-                            fpMessage3 = body.copyOf()
-                        }
                         val out = ByteArrayOutputStream()
-                        var handledByHelper = false
-                        if (fairPlayHelper != null) {
-                            try {
-                                val m = fairPlayHelper.javaClass.declaredMethods.firstOrNull { it.name == "fairPlaySetup" }
-                                if (m != null) {
-                                    m.isAccessible = true
-                                    m.invoke(fairPlayHelper, ByteArrayInputStream(body), out)
-                                    handledByHelper = out.size() > 0
-                                }
-                            } catch (_: Exception) {}
-                        }
-                        if (!handledByHelper) {
-                            handleFallbackFairPlaySetup(body, out)
-                        }
-                        sendResponse(output, "200 OK", "application/octet-stream", out.toByteArray(), cseq)
+                        fairPlay.fairPlaySetup(ByteArrayInputStream(body), out)
+                        val replyBytes = out.toByteArray()
+                        logTv("fp-setup procesado (in=${body.size}B -> out=${replyBytes.size}B)")
+                        sendResponse(output, "200 OK", "application/octet-stream", replyBytes, cseq)
                     }
 
-                    // 5. SETUP -> Negociación de llaves ekey/eiv y puertos de Video (7100) / Audio (7103)
+                    // 5. SETUP -> Negociación de llaves ekey/eiv, NTP timing y puertos de Video (7100) / Audio (7103)
                     method == "SETUP" -> {
                         val respDict = NSDictionary()
                         if (body.isNotEmpty()) {
                             try {
                                 val reqPlist = PropertyListParser.parse(body) as? NSDictionary
                                 if (reqPlist != null) {
+                                    // Si trae timingPort del cliente Mac, enviar pulso NTP UDP inicial
+                                    val clientTimingPort = (reqPlist["timingPort"] as? NSNumber)?.intValue() ?: 0
+                                    if (clientTimingPort > 0) {
+                                        sendNtpRequestToClient(socket.inetAddress, clientTimingPort)
+                                    }
+
+                                    // Primera llamada SETUP: Descifrar ekey (72B) -> rawFairPlayAesKey (16B) usando PlayFair S-Box
                                     if (reqPlist.containsKey("ekey")) {
                                         val ekeyData = (reqPlist["ekey"] as? NSData)?.bytes()
                                         val eivData = (reqPlist["eiv"] as? NSData)?.bytes()
                                         setupEiv = eivData
                                         if (ekeyData != null) {
-                                            rawFairPlayAesKey = decryptFairPlayEkey(fairPlayHelper, fpMessage3, ekeyData)
+                                            rawFairPlayAesKey = fairPlay.decrypt(ekeyData)
+                                            logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0} bytes)")
                                             if (rawFairPlayAesKey != null && sharedSecret != null && eivData != null) {
                                                 initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, eivData, null)
                                             }
                                         }
                                     }
 
+                                    // Segunda llamada SETUP: Configurar canales de stream (110 = Video Mirroring, 96 = Audio)
                                     val streamsObj = reqPlist["streams"] as? NSArray
                                     if (streamsObj != null) {
-                                        val outStreams = NSArray(streamsObj.count())
+                                        val outList = mutableListOf<NSObject>()
                                         for (i in 0 until streamsObj.count()) {
                                             val streamDict = streamsObj.objectAtIndex(i) as? NSDictionary ?: continue
                                             val type = (streamDict["type"] as? NSNumber)?.intValue() ?: 0
@@ -376,22 +437,32 @@ class AirPlayBonjourService(
                                                     val vStream = NSDictionary()
                                                     vStream["type"] = NSNumber(110)
                                                     vStream["dataPort"] = NSNumber(7100)
-                                                    outStreams.setValue(i, vStream)
+                                                    outList.add(vStream)
+                                                    logTv("SETUP Video Stream (type=110) -> puerto TCP 7100 asignado")
                                                 }
                                                 96 -> { // Audio Stream
                                                     val aStream = NSDictionary()
                                                     aStream["type"] = NSNumber(96)
                                                     aStream["dataPort"] = NSNumber(7103)
                                                     aStream["controlPort"] = NSNumber(7104)
-                                                    outStreams.setValue(i, aStream)
+                                                    outList.add(aStream)
+                                                    logTv("SETUP Audio Stream (type=96) -> puertos UDP 7103/7104")
+                                                }
+                                                else -> {
+                                                    val genericStream = NSDictionary()
+                                                    genericStream["type"] = NSNumber(type)
+                                                    genericStream["dataPort"] = NSNumber(7103)
+                                                    outList.add(genericStream)
                                                 }
                                             }
                                         }
-                                        respDict["streams"] = outStreams
+                                        if (outList.isNotEmpty()) {
+                                            respDict["streams"] = NSArray(*outList.toTypedArray())
+                                        }
                                     }
                                 }
-                            } catch (e: Exception) {
-                                Log.e("AirPlayRTSP", "Error parseando SETUP plist: ${e.message}")
+                            } catch (e: Throwable) {
+                                logTv("Error en SETUP: ${e.message}")
                             }
                         }
                         respDict["eventPort"] = NSNumber(7101)
@@ -400,13 +471,13 @@ class AirPlayBonjourService(
                         sendResponse(output, "200 OK", "application/x-apple-binary-plist", respBytes, cseq)
                     }
 
-                    // 6. Peticiones de control de sesión RTSP
+                    // 6. Peticiones de mantenimiento de sesión RTSP (GET_PARAMETER, RECORD, feedback, etc.)
                     method == "GET_PARAMETER" -> {
                         val resp = "volume: 0.000000\r\n".toByteArray()
                         sendResponse(output, "200 OK", "text/parameters", resp, cseq)
                     }
                     method == "RECORD" || method == "SET_PARAMETER" || method == "OPTIONS" ||
-                    path == "/feedback" || path == "/audioMode" -> {
+                    method == "FLUSH" || path == "/feedback" || path == "/audioMode" -> {
                         sendResponse(output, "200 OK", "text/plain", ByteArray(0), cseq)
                     }
 
@@ -421,7 +492,7 @@ class AirPlayBonjourService(
                                 val plist = PropertyListParser.parse(body) as? NSDictionary
                                 val contentLoc = plist?.get("Content-Location")?.toString()
                                 if (!contentLoc.isNullOrEmpty()) onPlayUrl(contentLoc)
-                            } catch (_: Exception) {}
+                            } catch (_: Throwable) {}
                         }
                         sendResponse(output, "200 OK", "text/parameters", ByteArray(0), cseq)
                     }
@@ -446,47 +517,18 @@ class AirPlayBonjourService(
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.i("AirPlayRTSP", "Sesión RTSP cerrada: ${e.message}")
+        } catch (e: Throwable) {
+            logTv("Sesión RTSP :$localPort finalizada: ${e.message}")
         } finally {
-            try { socket.close() } catch (_: Exception) {}
+            try { socket.close() } catch (_: Throwable) {}
         }
     }
 
-    private fun decryptFairPlayEkey(fairPlayHelper: Any?, fpMessage3: ByteArray?, ekey: ByteArray): ByteArray? {
-        if (fairPlayHelper != null) {
-            try {
-                val m = fairPlayHelper.javaClass.declaredMethods.firstOrNull {
-                    it.name == "decrypt" && it.parameterTypes.size == 1 && it.parameterTypes[0] == ByteArray::class.java
-                }
-                if (m != null) {
-                    m.isAccessible = true
-                    val res = m.invoke(fairPlayHelper, ekey) as? ByteArray
-                    if (res != null && res.size == 16) return res
-                }
-            } catch (_: Exception) {}
-        }
-        if (fpMessage3 != null) {
-            try {
-                val cls = Class.forName("com.omnicast.tv.playfair.PlayFair")
-                val m = cls.declaredMethods.firstOrNull { it.parameterTypes.size == 3 }
-                if (m != null) {
-                    m.isAccessible = true
-                    val outKey = ByteArray(16)
-                    val inst = if (Modifier.isStatic(m.modifiers)) null else cls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
-                    m.invoke(inst, fpMessage3, ekey, outKey)
-                    return outKey
-                }
-            } catch (_: Exception) {}
-        }
-        return if (ekey.size >= 16) ekey.copyOfRange(0, 16) else null
-    }
-
-    private fun initVideoCipher(rawAesKey: ByteArray, sharedSecret: ByteArray, eiv: ByteArray?, streamConnectionID: Long?) {
+    private fun initVideoCipher(rawAesKey: ByteArray, secret: ByteArray, eiv: ByteArray?, streamConnectionID: Long?) {
         try {
             val sha512 = MessageDigest.getInstance("SHA-512")
             sha512.update(rawAesKey)
-            sha512.update(sharedSecret)
+            sha512.update(secret)
             val eadc = sha512.digest().copyOfRange(0, 16)
 
             val finalKey: ByteArray
@@ -513,9 +555,9 @@ class AirPlayBonjourService(
             activeVideoCipher = Cipher.getInstance("AES/CTR/NoPadding").apply {
                 init(Cipher.DECRYPT_MODE, SecretKeySpec(finalKey, "AES"), IvParameterSpec(finalIv))
             }
-            Log.i("AirPlayCipher", "Descifrador de video AES-CTR inicializado (streamConnectionID=$streamConnectionID)")
-        } catch (e: Exception) {
-            Log.e("AirPlayCipher", "Error iniciando AES-CTR: ${e.message}")
+            logTv("AES-CTR de video listo (streamID=${streamConnectionID ?: 0L})")
+        } catch (e: Throwable) {
+            logTv("Error iniciando AES-CTR: ${e.message}")
         }
     }
 
@@ -543,10 +585,10 @@ class AirPlayBonjourService(
     }
 
     private fun handleMirroringVideoStream(socket: Socket) {
-        Log.i("AirPlayMirror", "¡Conexión de duplicación de pantalla activa desde Mac/iOS en puerto 7100!")
+        logTv("¡Stream de pantalla H.264 conectado en puerto 7100!")
         try {
             socket.tcpNoDelay = true
-            socket.receiveBufferSize = 524288
+            socket.receiveBufferSize = 1048576
             val dis = DataInputStream(socket.getInputStream())
 
             onStartMirroring(1920, 1080, 60)
@@ -556,9 +598,10 @@ class AirPlayBonjourService(
                 dis.readFully(header)
 
                 val payloadSize = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                val payloadType = ByteBuffer.wrap(header, 4, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xFFFF
+                // En AirPlay Mirroring el tipo de paquete está en el byte 4 (0 = Video H.264, 1 = SPS/PPS avcC)
+                val payloadType = header[4].toInt() and 0xFF
 
-                if (payloadSize < 0 || payloadSize > 10_000_000) break
+                if (payloadSize < 0 || payloadSize > 15_000_000) break
                 val payload = ByteArray(payloadSize)
                 if (payloadSize > 0) {
                     dis.readFully(payload)
@@ -566,18 +609,14 @@ class AirPlayBonjourService(
 
                 when (payloadType) {
                     1 -> {
-                        // Paquete de configuración avcC (SPS + PPS sin cifrar)
                         val annexBConfig = convertAvcCToAnnexB(payload)
                         if (annexBConfig.isNotEmpty()) {
                             onH264Nal(annexBConfig)
                         }
                     }
                     0 -> {
-                        // Paquete de video H.264 (descifrar con AES-CTR si no viene en claro)
-                        if (!isUnencryptedAvccFrame(payload)) {
-                            decryptVideoPacket(payload)
-                        }
-                        // Reemplazar longitudes AVCC de 4 bytes por start codes Annex-B (00 00 00 01)
+                        decryptVideoPacket(payload)
+                        // Convertir prefijos AVCC de 4 bytes a códigos Annex-B (00 00 00 01)
                         var offset = 0
                         while (offset + 4 <= payload.size) {
                             val nalLen = ((payload[offset].toInt() and 0xFF) shl 24) or
@@ -595,32 +634,12 @@ class AirPlayBonjourService(
                     }
                 }
             }
-        } catch (e: Exception) {
-            Log.i("AirPlayMirror", "Fin del stream de pantalla: ${e.message}")
+        } catch (e: Throwable) {
+            logTv("Stream de pantalla finalizado: ${e.message}")
         } finally {
-            try { socket.close() } catch (_: Exception) {}
+            try { socket.close() } catch (_: Throwable) {}
             onStop()
         }
-    }
-
-    private fun isUnencryptedAvccFrame(data: ByteArray): Boolean {
-        if (data.size < 5) return false
-        var offset = 0
-        var count = 0
-        while (offset + 4 <= data.size) {
-            val len = ((data[offset].toInt() and 0xFF) shl 24) or
-                    ((data[offset + 1].toInt() and 0xFF) shl 16) or
-                    ((data[offset + 2].toInt() and 0xFF) shl 8) or
-                    (data[offset + 3].toInt() and 0xFF)
-            if (len <= 0 || offset + 4 + len > data.size) return false
-            val nalHeader = data[offset + 4].toInt()
-            if ((nalHeader and 0x80) != 0) return false
-            val nalType = nalHeader and 0x1F
-            if (nalType !in 1..23) return false
-            offset += 4 + len
-            count++
-        }
-        return count > 0 && offset == data.size
     }
 
     private fun convertAvcCToAnnexB(avcC: ByteArray): ByteArray {
@@ -653,15 +672,29 @@ class AirPlayBonjourService(
                 }
             }
             out.toByteArray()
-        } catch (_: Exception) {
+        } catch (_: Throwable) {
             ByteArray(0)
         }
     }
 
+    /**
+     * Carga el descriptor binario oficial de Apple TV (airplay_info.plist inyectado por Gradle)
+     * y actualiza 'pk' y 'deviceid' para que coincidan exactamente con nuestra llave Ed25519.
+     */
     private fun buildServerInfoBinaryPlist(): ByteArray {
+        try {
+            val rawBytes = context.assets.open("airplay_info.plist").use { it.readBytes() }
+            val dict = PropertyListParser.parse(rawBytes) as? NSDictionary
+            if (dict != null) {
+                dict["deviceid"] = NSString(macAddress)
+                dict["pk"] = NSData(edPublicKeyBytes)
+                return BinaryPropertyListWriter.writeToArray(dict)
+            }
+        } catch (_: Throwable) {}
+
         val root = NSDictionary()
         root["deviceid"] = NSString(macAddress)
-        root["features"] = NSNumber(130619829911L) // 0x1E5A7FFFF7
+        root["features"] = NSNumber(130367487991L) // 0x1E5A7FFFF7
         root["model"] = NSString("AppleTV3,2")
         root["protovers"] = NSString("1.0")
         root["srcvers"] = NSString("220.68")
@@ -674,8 +707,8 @@ class AirPlayBonjourService(
 
         val display = NSDictionary()
         display["uuid"] = NSString("e5f7a68d-7b0f-4305-984b-974f677a150b")
-        display["widthPhysical"] = NSNumber(false)
-        display["heightPhysical"] = NSNumber(false)
+        display["widthPhysical"] = NSNumber(0)
+        display["heightPhysical"] = NSNumber(0)
         display["width"] = NSNumber(1920)
         display["height"] = NSNumber(1080)
         display["widthPixels"] = NSNumber(1920)
@@ -687,48 +720,7 @@ class AirPlayBonjourService(
         display["rotation"] = NSNumber(false)
         root["displays"] = NSArray(display)
 
-        val af0 = NSDictionary().apply {
-            put("type", NSNumber(100))
-            put("audioInputFormats", NSNumber(67108860))
-            put("audioOutputFormats", NSNumber(67108860))
-        }
-        val af1 = NSDictionary().apply {
-            put("type", NSNumber(101))
-            put("audioInputFormats", NSNumber(67108860))
-            put("audioOutputFormats", NSNumber(67108860))
-        }
-        root["audioFormats"] = NSArray(af0, af1)
-
-        val al0 = NSDictionary().apply {
-            put("type", NSNumber(100))
-            put("audioType", NSString("default"))
-            put("inputLatencyMicros", NSNumber(false))
-            put("outputLatencyMicros", NSNumber(false))
-        }
-        val al1 = NSDictionary().apply {
-            put("type", NSNumber(101))
-            put("audioType", NSString("default"))
-            put("inputLatencyMicros", NSNumber(false))
-            put("outputLatencyMicros", NSNumber(false))
-        }
-        root["audioLatencies"] = NSArray(al0, al1)
-
         return BinaryPropertyListWriter.writeToArray(root)
-    }
-
-    private fun handleFallbackFairPlaySetup(body: ByteArray, out: OutputStream) {
-        if (body.size == 16 && body[4].toInt() == 1) {
-            val reply = ByteArray(142)
-            reply[0] = 0x46; reply[1] = 0x50; reply[2] = 0x4C; reply[3] = 0x59
-            reply[4] = 0x03; reply[5] = 0x01; reply[6] = 0x02; reply[7] = 0x00
-            reply[8] = 0x00; reply[9] = 0x00; reply[10] = 0x00; reply[11] = 0x82.toByte()
-            reply[12] = 0x02; reply[13] = body[14]
-            out.write(reply)
-        } else if (body.size == 164 && body[4].toInt() == 3) {
-            val header = byteArrayOf(0x46, 0x50, 0x4C, 0x59, 0x03, 0x01, 0x04, 0x00, 0x00, 0x00, 0x00, 0x14)
-            out.write(header)
-            out.write(body, 144, 20)
-        }
     }
 
     private fun sendResponse(output: OutputStream, status: String, contentType: String, body: ByteArray, cseq: String?) {
@@ -757,16 +749,16 @@ class AirPlayBonjourService(
 
     fun stop() {
         isRunning = false
-        try { airplaySocket7000?.close() } catch (_: Exception) {}
-        try { raopSocket5000?.close() } catch (_: Exception) {}
-        try { videoDataSocket7100?.close() } catch (_: Exception) {}
-        try { videoEventSocket7101?.close() } catch (_: Exception) {}
-        try { timingUdp7102?.close() } catch (_: Exception) {}
-        try { audioDataUdp7103?.close() } catch (_: Exception) {}
-        try { audioCtrlUdp7104?.close() } catch (_: Exception) {}
+        try { airplaySocket7000?.close() } catch (_: Throwable) {}
+        try { raopSocket5000?.close() } catch (_: Throwable) {}
+        try { videoDataSocket7100?.close() } catch (_: Throwable) {}
+        try { videoEventSocket7101?.close() } catch (_: Throwable) {}
+        try { timingUdp7102?.close() } catch (_: Throwable) {}
+        try { audioDataUdp7103?.close() } catch (_: Throwable) {}
+        try { audioCtrlUdp7104?.close() } catch (_: Throwable) {}
         try {
             jmdns?.unregisterAllServices()
             jmdns?.close()
-        } catch (_: Exception) {}
+        } catch (_: Throwable) {}
     }
 }
