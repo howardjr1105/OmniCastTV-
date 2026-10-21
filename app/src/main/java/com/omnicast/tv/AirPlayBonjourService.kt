@@ -382,7 +382,7 @@ class AirPlayBonjourService(
                                         val eivData = (reqPlist["eiv"] as? NSData)?.bytes()
                                         setupEiv = eivData
                                         if (ekeyData != null) {
-                                            rawFairPlayAesKey = fairPlay.decrypt(ekeyData)
+                                            rawFairPlayAesKey = fairPlay.decryptAesKey(ekeyData)
                                             logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0}B)")
                                             if (rawFairPlayAesKey != null && sharedSecret != null && eivData != null) {
                                                 initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, eivData, null)

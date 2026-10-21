@@ -101,6 +101,17 @@ val injectFairPlayEngine by tasks.registering {
                                                 "public class $className"
                                             )
                                         }
+                                        // Hacer públicos los métodos package-private en FairPlay.java
+                                        if (className == "FairPlay") {
+                                            content = content.replace(
+                                                Regex("(?m)^(\\s+)(void\\s+fairPlaySetup)"),
+                                                "$1public $2"
+                                            )
+                                            content = content.replace(
+                                                Regex("(?m)^(\\s+)(byte\\[\\]\\s+decryptAesKey)"),
+                                                "$1public $2"
+                                            )
+                                        }
                                         File(targetJavaDir, fileName).writeText(content, Charsets.UTF_8)
                                         copiedCount++
                                         println(">>> [OmniCast] Inyectado en com.omnicast.tv.playfair: $fileName")
