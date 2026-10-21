@@ -88,6 +88,7 @@ class AirPlayBonjourService(
     @Volatile private var rawFairPlayAesKey: ByteArray? = null
     @Volatile private var setupEiv: ByteArray? = null
     @Volatile private var activeVideoCipher: Cipher? = null
+    @Volatile private var cipherDiag = "SETUP sin ekey"
     private val ogBlock = ByteArray(16)
     @Volatile private var nextDecryptCount = 0
 
@@ -381,9 +382,15 @@ class AirPlayBonjourService(
                                         val ekeyData = (reqPlist["ekey"] as? NSData)?.bytes()
                                         val eivData = (reqPlist["eiv"] as? NSData)?.bytes()
                                         setupEiv = eivData
-                                        logTv("SETUP ekey=${ekeyData?.size ?: -1}B eiv=${eivData?.size ?: -1}B secret=${sharedSecret?.size ?: -1}B")
+                                        cipherDiag = "ekey=${ekeyData?.size}B eiv=${eivData?.size}B secret=${sharedSecret?.size}B"
                                         if (ekeyData != null) {
-                                            rawFairPlayAesKey = fairPlay.decryptAesKey(ekeyData)
+                                            rawFairPlayAesKey = try {
+                                                fairPlay.decryptAesKey(ekeyData)
+                                            } catch (e: Throwable) {
+                                                cipherDiag += " decryptAesKey ERR ${e.javaClass.simpleName}: ${e.message}"
+                                                null
+                                            }
+                                            cipherDiag += " key=${rawFairPlayAesKey?.size}B"
                                             logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0}B)")
                                             if (rawFairPlayAesKey != null && sharedSecret != null && eivData != null) {
                                                 initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, eivData, null)
@@ -400,7 +407,7 @@ class AirPlayBonjourService(
                                             when (type) {
                                                 110 -> {
                                                     val streamConnId = (streamDict["streamConnectionID"] as? NSNumber)?.longValue()
-                                                    logTv("SETUP video streamConnectionID=${streamConnId?.let { java.lang.Long.toUnsignedString(it) }} key=${rawFairPlayAesKey != null}")
+                                                    cipherDiag += " sid=${streamConnId != null}"
                                                     if (rawFairPlayAesKey != null && sharedSecret != null) {
                                                         initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, setupEiv, streamConnId)
                                                     }
@@ -435,6 +442,7 @@ class AirPlayBonjourService(
                                     }
                                 }
                             } catch (e: Throwable) {
+                                cipherDiag += " SETUP ERR ${e.javaClass.simpleName}: ${e.message}"
                                 logTv("Error en SETUP: ${e.message}")
                             }
                         }
@@ -527,6 +535,7 @@ class AirPlayBonjourService(
             }
             logTv("AES-CTR de video listo (streamID=${streamConnectionID ?: 0L})")
         } catch (e: Throwable) {
+            cipherDiag += " AES ERR ${e.message}"
             logTv("Error iniciando AES-CTR: ${e.message}")
         }
     }
@@ -613,7 +622,7 @@ class AirPlayBonjourService(
                                 logTv("Primer cuadro H.264 decodificado (NAL=$firstNalType, ${payload.size}B)")
                             }
                         } else if (frameCounter == 0) {
-                            logTv("Error: Paquete H.264 sin cabeceras AVCC válidas (${payload.size}B) cipher=${activeVideoCipher != null} " +
+                            logTv("Error: Paquete H.264 sin cabeceras AVCC válidas (${payload.size}B) cipher=${activeVideoCipher != null} [$cipherDiag] " +
                                 "enc=${encHead?.toHex()} dec=${payload.copyOf(minOf(8, payload.size)).toHex()}")
                         }
                     }
