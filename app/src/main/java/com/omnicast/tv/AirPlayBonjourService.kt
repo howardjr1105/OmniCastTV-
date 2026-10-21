@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.InputStream
 import java.io.OutputStream
+import java.lang.reflect.Modifier
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
@@ -40,8 +41,6 @@ import javax.jmdns.ServiceInfo
 
 /**
  * Receptor AirPlay 2 Nativo para macOS / iOS (Screen Mirroring H.264 60 FPS + Video + Fotos).
- * Usa las tablas reales FairPlay SAP v2.5 (FairPlay / PlayFair inyectadas por Gradle en preBuild),
- * Curve25519.JAVA (sin errores JNI en Android), NTP UDP responder en puerto 7102 y log en pantalla.
  */
 class AirPlayBonjourService(
     private val context: Context,
@@ -66,7 +65,6 @@ class AirPlayBonjourService(
     private var audioDataUdp7103: DatagramSocket? = null
     private var audioCtrlUdp7104: DatagramSocket? = null
 
-    // Semilla determinista Ed25519 para que la llave pública 'pk' sea siempre consistente con Bonjour y /info
     private val edCurveSpec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
     private val edPrivateKey: EdDSAPrivateKey
     private val edPublicKey: EdDSAPublicKey
@@ -86,8 +84,9 @@ class AirPlayBonjourService(
     private val macAddress = "AA:BB:CC:11:22:33"
     private val macCompact = "AABBCC112233"
 
-    // Estado de sesión compartido (preservado incluso si macOS usa conexiones TCP separadas en :7000 y :5000)
-    private val fairPlay = FairPlay()
+    // Estado de sesión compartido entre conexiones
+    @Volatile private var fairPlayHelper: Any? = null
+    @Volatile private var fpMessage3: ByteArray? = null
     @Volatile private var sharedSecret: ByteArray? = null
     @Volatile private var pairCipher: Cipher? = null
     @Volatile private var rawFairPlayAesKey: ByteArray? = null
@@ -101,9 +100,30 @@ class AirPlayBonjourService(
         onLogEvent(msg)
     }
 
+    private fun ensureFairPlayInstance(): Any? {
+        if (fairPlayHelper != null) return fairPlayHelper
+        val candidates = listOf(
+            "com.omnicast.tv.playfair.FairPlay",
+            "com.omnicast.tv.FairPlay"
+        )
+        for (name in candidates) {
+            try {
+                val cls = Class.forName(name)
+                val inst = cls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+                fairPlayHelper = inst
+                logTv("Motor FairPlay SAP v2.5 cargado ($name)")
+                return inst
+            } catch (_: Throwable) {}
+        }
+        logTv("Aviso: Clase FairPlay no encontrada en APK")
+        return null
+    }
+
     fun start() {
         if (isRunning) return
         isRunning = true
+
+        ensureFairPlayInstance()
 
         // 1. Anunciar servicios _airplay._tcp.local. (7000) y _raop._tcp.local. (5000)
         executor.execute {
@@ -171,7 +191,7 @@ class AirPlayBonjourService(
         startRtspListener(7000) { airplaySocket7000 = it }
         startRtspListener(5000) { raopSocket5000 = it }
 
-        // 3. Puerto 7101 TCP (Event Channel requerido por macOS tras SETUP)
+        // 3. Puerto 7101 TCP (Event Channel)
         executor.execute {
             try {
                 videoEventSocket7101 = ServerSocket(7101).apply { reuseAddress = true }
@@ -193,7 +213,7 @@ class AirPlayBonjourService(
             } catch (_: Throwable) {}
         }
 
-        // 4. Puerto 7102 UDP (Servidor NTP Timing requerido por macOS para sincronizar reloj de video)
+        // 4. Puerto 7102 UDP (Servidor NTP Timing)
         executor.execute {
             try {
                 timingUdp7102 = DatagramSocket(7102).apply { reuseAddress = true }
@@ -239,7 +259,6 @@ class AirPlayBonjourService(
         reply[1] = 0xD3.toByte()
         reply[2] = req[2]
         reply[3] = 0x07
-        // Copiar Transmit Timestamp del cliente (bytes 24..31) al Origin Timestamp (bytes 8..15)
         System.arraycopy(req, 24, reply, 8, 8)
         val ntpNow = currentNtpTimestamp()
         ByteBuffer.wrap(reply, 16, 8).order(ByteOrder.BIG_ENDIAN).putLong(ntpNow)
@@ -327,23 +346,19 @@ class AirPlayBonjourService(
                 }
 
                 when {
-                    // 1. GET /info -> Descriptor Binary Plist de Apple TV con nuestra llave pública Ed25519
                     path.startsWith("/info") || path == "/server-info" -> {
                         val bplist = buildServerInfoBinaryPlist()
                         sendResponse(output, "200 OK", "application/x-apple-binary-plist", bplist, cseq)
                     }
 
-                    // 2. POST /pair-setup -> Llave pública Ed25519 (32 bytes)
                     path == "/pair-setup" -> {
                         sendResponse(output, "200 OK", "application/octet-stream", edPublicKeyBytes, cseq)
                     }
 
-                    // 3. POST /pair-verify -> Handshake Curve25519.JAVA + Ed25519 + AES-128-CTR
                     path == "/pair-verify" && body.size >= 68 -> {
                         val flag = body[0].toInt()
                         if (flag > 0) {
                             val clientCurvePub = body.copyOfRange(4, 36)
-                            // IMPORTANTE: Curve25519.JAVA usa implementación 100% Java (no requiere JNI .so en Android)
                             val curve25519 = Curve25519.getInstance(Curve25519.JAVA)
                             val curveKeyPair = curve25519.generateKeyPair()
                             val serverCurvePub = curveKeyPair.publicKey
@@ -385,43 +400,39 @@ class AirPlayBonjourService(
                         }
                     }
 
-                    // 4. POST /fp-setup -> Handshake FairPlay SAP v2.5 real usando las S-Boxes de FairPlay.java
                     path == "/fp-setup" && body.isNotEmpty() -> {
-                        val out = ByteArrayOutputStream()
-                        fairPlay.fairPlaySetup(ByteArrayInputStream(body), out)
-                        val replyBytes = out.toByteArray()
+                        if (body.size == 164) {
+                            fpMessage3 = body.copyOf()
+                        }
+                        val replyBytes = runFairPlaySetup(body)
                         logTv("fp-setup procesado (in=${body.size}B -> out=${replyBytes.size}B)")
                         sendResponse(output, "200 OK", "application/octet-stream", replyBytes, cseq)
                     }
 
-                    // 5. SETUP -> Negociación de llaves ekey/eiv, NTP timing y puertos de Video (7100) / Audio (7103)
                     method == "SETUP" -> {
                         val respDict = NSDictionary()
                         if (body.isNotEmpty()) {
                             try {
                                 val reqPlist = PropertyListParser.parse(body) as? NSDictionary
                                 if (reqPlist != null) {
-                                    // Si trae timingPort del cliente Mac, enviar pulso NTP UDP inicial
                                     val clientTimingPort = (reqPlist["timingPort"] as? NSNumber)?.intValue() ?: 0
                                     if (clientTimingPort > 0) {
                                         sendNtpRequestToClient(socket.inetAddress, clientTimingPort)
                                     }
 
-                                    // Primera llamada SETUP: Descifrar ekey (72B) -> rawFairPlayAesKey (16B) usando PlayFair S-Box
                                     if (reqPlist.containsKey("ekey")) {
                                         val ekeyData = (reqPlist["ekey"] as? NSData)?.bytes()
                                         val eivData = (reqPlist["eiv"] as? NSData)?.bytes()
                                         setupEiv = eivData
                                         if (ekeyData != null) {
-                                            rawFairPlayAesKey = fairPlay.decrypt(ekeyData)
-                                            logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0} bytes)")
+                                            rawFairPlayAesKey = decryptFairPlayEkey(ekeyData)
+                                            logTv("Llave FairPlay ekey descifrada (${rawFairPlayAesKey?.size ?: 0}B)")
                                             if (rawFairPlayAesKey != null && sharedSecret != null && eivData != null) {
                                                 initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, eivData, null)
                                             }
                                         }
                                     }
 
-                                    // Segunda llamada SETUP: Configurar canales de stream (110 = Video Mirroring, 96 = Audio)
                                     val streamsObj = reqPlist["streams"] as? NSArray
                                     if (streamsObj != null) {
                                         val outList = mutableListOf<NSObject>()
@@ -429,7 +440,7 @@ class AirPlayBonjourService(
                                             val streamDict = streamsObj.objectAtIndex(i) as? NSDictionary ?: continue
                                             val type = (streamDict["type"] as? NSNumber)?.intValue() ?: 0
                                             when (type) {
-                                                110 -> { // Screen Mirroring Video Stream
+                                                110 -> {
                                                     val streamConnId = (streamDict["streamConnectionID"] as? NSNumber)?.longValue()
                                                     if (rawFairPlayAesKey != null && sharedSecret != null) {
                                                         initVideoCipher(rawFairPlayAesKey!!, sharedSecret!!, setupEiv, streamConnId)
@@ -438,9 +449,9 @@ class AirPlayBonjourService(
                                                     vStream["type"] = NSNumber(110)
                                                     vStream["dataPort"] = NSNumber(7100)
                                                     outList.add(vStream)
-                                                    logTv("SETUP Video Stream (type=110) -> puerto TCP 7100 asignado")
+                                                    logTv("SETUP Video Stream (type=110) -> puerto TCP 7100")
                                                 }
-                                                96 -> { // Audio Stream
+                                                96 -> {
                                                     val aStream = NSDictionary()
                                                     aStream["type"] = NSNumber(96)
                                                     aStream["dataPort"] = NSNumber(7103)
@@ -471,7 +482,6 @@ class AirPlayBonjourService(
                         sendResponse(output, "200 OK", "application/x-apple-binary-plist", respBytes, cseq)
                     }
 
-                    // 6. Peticiones de mantenimiento de sesión RTSP (GET_PARAMETER, RECORD, feedback, etc.)
                     method == "GET_PARAMETER" -> {
                         val resp = "volume: 0.000000\r\n".toByteArray()
                         sendResponse(output, "200 OK", "text/parameters", resp, cseq)
@@ -481,7 +491,6 @@ class AirPlayBonjourService(
                         sendResponse(output, "200 OK", "text/plain", ByteArray(0), cseq)
                     }
 
-                    // 7. AirPlay Video directo (/play)
                     path.startsWith("/play") -> {
                         val bodyStr = String(body, Charsets.UTF_8)
                         val urlMatch = Regex("(https?://[^\\s\\x00-\\x1f<>\"]+)").find(bodyStr)
@@ -497,7 +506,6 @@ class AirPlayBonjourService(
                         sendResponse(output, "200 OK", "text/parameters", ByteArray(0), cseq)
                     }
 
-                    // 8. AirPlay Fotos (/photo)
                     path.startsWith("/photo") && body.isNotEmpty() -> {
                         onPhotoBytes(body)
                         sendResponse(output, "200 OK", "text/plain", ByteArray(0), cseq)
@@ -522,6 +530,71 @@ class AirPlayBonjourService(
         } finally {
             try { socket.close() } catch (_: Throwable) {}
         }
+    }
+
+    private fun runFairPlaySetup(body: ByteArray): ByteArray {
+        val helper = ensureFairPlayInstance()
+        if (helper != null) {
+            try {
+                for (m in helper.javaClass.declaredMethods) {
+                    if (m.name.contains("fairPlaySetup", ignoreCase = true) || m.name.contains("setup", ignoreCase = true)) {
+                        m.isAccessible = true
+                        val pTypes = m.parameterTypes
+                        if (pTypes.size == 2 && InputStream::class.java.isAssignableFrom(pTypes[0]) && OutputStream::class.java.isAssignableFrom(pTypes[1])) {
+                            val out = ByteArrayOutputStream()
+                            m.invoke(helper, ByteArrayInputStream(body), out)
+                            if (out.size() > 0) return out.toByteArray()
+                        } else if (pTypes.size == 1 && pTypes[0] == ByteArray::class.java) {
+                            val res = m.invoke(helper, body) as? ByteArray
+                            if (res != null && res.isNotEmpty()) return res
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                logTv("Error invocando fairPlaySetup: ${e.message}")
+            }
+        }
+        return ByteArray(0)
+    }
+
+    private fun decryptFairPlayEkey(ekey: ByteArray): ByteArray? {
+        val helper = ensureFairPlayInstance()
+        if (helper != null) {
+            try {
+                for (m in helper.javaClass.declaredMethods) {
+                    if (m.name.contains("decrypt", ignoreCase = true)) {
+                        m.isAccessible = true
+                        val pTypes = m.parameterTypes
+                        if (pTypes.size == 1 && pTypes[0] == ByteArray::class.java) {
+                            val res = m.invoke(helper, ekey) as? ByteArray
+                            if (res != null && res.isNotEmpty()) return res
+                        } else if (pTypes.size == 2 && pTypes[0] == ByteArray::class.java && pTypes[1] == ByteArray::class.java) {
+                            val outKey = ByteArray(16)
+                            m.invoke(helper, ekey, outKey)
+                            return outKey
+                        }
+                    }
+                }
+            } catch (e: Throwable) {
+                logTv("Error invocando FairPlay.decrypt: ${e.message}")
+            }
+        }
+        val msg3 = fpMessage3
+        if (msg3 != null) {
+            try {
+                val cls = Class.forName("com.omnicast.tv.playfair.PlayFair")
+                for (m in cls.declaredMethods) {
+                    if (m.parameterTypes.size == 3) {
+                        m.isAccessible = true
+                        val outKey = ByteArray(16)
+                        val inst = if (Modifier.isStatic(m.modifiers)) null else cls.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
+                        m.invoke(inst, msg3, ekey, outKey)
+                        return outKey
+                    }
+                }
+            } catch (_: Throwable) {}
+        }
+        return if (ekey.size >= 16) ekey.copyOfRange(0, 16) else null
     }
 
     private fun initVideoCipher(rawAesKey: ByteArray, secret: ByteArray, eiv: ByteArray?, streamConnectionID: Long?) {
@@ -598,7 +671,6 @@ class AirPlayBonjourService(
                 dis.readFully(header)
 
                 val payloadSize = ByteBuffer.wrap(header, 0, 4).order(ByteOrder.LITTLE_ENDIAN).int
-                // En AirPlay Mirroring el tipo de paquete está en el byte 4 (0 = Video H.264, 1 = SPS/PPS avcC)
                 val payloadType = header[4].toInt() and 0xFF
 
                 if (payloadSize < 0 || payloadSize > 15_000_000) break
@@ -616,7 +688,6 @@ class AirPlayBonjourService(
                     }
                     0 -> {
                         decryptVideoPacket(payload)
-                        // Convertir prefijos AVCC de 4 bytes a códigos Annex-B (00 00 00 01)
                         var offset = 0
                         while (offset + 4 <= payload.size) {
                             val nalLen = ((payload[offset].toInt() and 0xFF) shl 24) or
@@ -677,10 +748,6 @@ class AirPlayBonjourService(
         }
     }
 
-    /**
-     * Carga el descriptor binario oficial de Apple TV (airplay_info.plist inyectado por Gradle)
-     * y actualiza 'pk' y 'deviceid' para que coincidan exactamente con nuestra llave Ed25519.
-     */
     private fun buildServerInfoBinaryPlist(): ByteArray {
         try {
             val rawBytes = context.assets.open("airplay_info.plist").use { it.readBytes() }
@@ -694,7 +761,7 @@ class AirPlayBonjourService(
 
         val root = NSDictionary()
         root["deviceid"] = NSString(macAddress)
-        root["features"] = NSNumber(130367487991L) // 0x1E5A7FFFF7
+        root["features"] = NSNumber(130367487991L)
         root["model"] = NSString("AppleTV3,2")
         root["protovers"] = NSString("1.0")
         root["srcvers"] = NSString("220.68")
