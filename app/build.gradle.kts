@@ -17,8 +17,8 @@ android {
         applicationId = "com.omnicast.tv"
         minSdk = 24
         targetSdk = 34
-        versionCode = 10
-        versionName = "2.6.0-Native"
+        versionCode = 11
+        versionName = "2.7.0-Native"
     }
 
     // Keystore fija (secreto de CI) para que cada versión se instale encima de la anterior sin desinstalar.
@@ -173,6 +173,8 @@ dependencies {
     implementation("androidx.media3:media3-ui:1.2.1")
     // JmDNS para anunciar servicios nativos _airplay._tcp.local. y _raop._tcp.local.
     implementation("org.jmdns:jmdns:3.5.9")
+    // QR en la pantalla de inicio para abrir el emisor web desde un teléfono
+    implementation("com.google.zxing:core:3.5.3")
     // Criptografía AirPlay 2 Nativa (Ed25519, Curve25519 ECDH, Apple Binary Plist y SLF4J)
     implementation("net.i2p.crypto:eddsa:0.3.0")
     implementation("org.whispersystems:curve25519-java:0.5.0")

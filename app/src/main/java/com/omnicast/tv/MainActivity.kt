@@ -1,6 +1,9 @@
 package com.omnicast.tv
 
+import android.animation.ObjectAnimator
+import android.animation.ValueAnimator
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
@@ -24,6 +27,9 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.EncodeHintType
+import com.google.zxing.qrcode.QRCodeWriter
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
@@ -41,7 +47,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusBadgeText: TextView
     private lateinit var liveLogTextView: TextView
 
-    private val logLines = ArrayDeque<String>(8)
+    private val logLines = ArrayDeque<String>(2)
     private val timeFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
 
     private var h264Decoder: HardwareH264Decoder? = null
@@ -52,8 +58,21 @@ class MainActivity : AppCompatActivity() {
     private var airPlayService: AirPlayBonjourService? = null
     private var streamServer: NativeStreamServer? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var pulseAnimator: ObjectAnimator? = null
 
     @Volatile private var surfaceReady = false
+
+    private val deviceName = "OmniCast Google TV"
+
+    // Paleta de la pantalla de inicio (fondo oscuro; un color de acento por método de conexión)
+    private val colorText = Color.parseColor("#F8FAFC")
+    private val colorMuted = Color.parseColor("#A5B4CB")
+    private val colorCard = Color.parseColor("#16163A")
+    private val colorCardBorder = Color.parseColor("#2E2E63")
+    private val colorBg = Color.parseColor("#0F0F23")
+    private val accentAirPlay = Color.parseColor("#60A5FA")
+    private val accentWeb = Color.parseColor("#22C55E")
+    private val accentMedia = Color.parseColor("#F59E0B")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -78,13 +97,13 @@ class MainActivity : AppCompatActivity() {
         audioPlayer = LowLatencyAudioPlayer()
 
         // 1. Iniciar Demonio DLNA / UPnP MediaRenderer (Puerto 1900 UDP)
-        dlnaService = DlnaSsdpService(localIp, 8080, "OmniCast Google TV").also { it.start() }
+        dlnaService = DlnaSsdpService(localIp, 8080, deviceName).also { it.start() }
 
         // 2. Iniciar Demonio AirPlay 2 + FairPlay SAP v2.5 + Bonjour mDNS
         airPlayService = AirPlayBonjourService(
             context = applicationContext,
             localIp = localIp,
-            deviceName = "OmniCast Google TV",
+            deviceName = deviceName,
             onLogEvent = { msg -> appendTvLog(msg) },
             onStartMirroring = { w, h, fps ->
                 startNativeHardwareMirror(w, h, fps)
@@ -126,7 +145,7 @@ class MainActivity : AppCompatActivity() {
     private fun appendTvLog(message: String) {
         val stamp = timeFormat.format(Date())
         runOnUiThread {
-            if (logLines.size >= 6) logLines.removeFirst()
+            if (logLines.size >= 2) logLines.removeFirst()
             logLines.addLast("[$stamp] $message")
             if (::liveLogTextView.isInitialized) {
                 liveLogTextView.text = logLines.joinToString("\n")
@@ -135,9 +154,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildNativeTvUi(localIp: String) {
-        rootLayout = FrameLayout(this).apply {
-            setBackgroundColor(Color.parseColor("#070B14"))
-        }
+        rootLayout = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
         mirrorSurfaceView = SurfaceView(this).apply {
             holder.addCallback(object : SurfaceHolder.Callback {
@@ -178,102 +195,28 @@ class MainActivity : AppCompatActivity() {
 
         standbyDashboard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(dp(44), dp(30), dp(44), dp(30))
+            setPadding(dp(36), dp(22), dp(36), dp(16))
             background = GradientDrawable(
                 GradientDrawable.Orientation.TL_BR,
-                intArrayOf(Color.parseColor("#090E1A"), Color.parseColor("#111827"), Color.parseColor("#1E1B4B"))
+                intArrayOf(colorBg, Color.parseColor("#17163F"), Color.parseColor("#1E1B4B"))
             )
         }
 
-        val headerRow = LinearLayout(this).apply {
+        standbyDashboard.addView(buildHeader(localIp))
+
+        val cards = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val titleText = TextView(this).apply {
-            text = "OmniCast Native TV v2.4 · AirPlay 2 + FairPlay SAP"
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 24f)
-            setTypeface(typeface, Typeface.BOLD)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        }
-        statusBadgeText = TextView(this).apply {
-            text = "● ACTIVO: AirPlay 2 + FairPlay + DLNA + MediaCodec"
-            setTextColor(Color.parseColor("#34D399"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(dp(14), dp(6), dp(14), dp(6))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#1410B981"))
-                setStroke(dp(1), Color.parseColor("#34D399"))
-                cornerRadius = dp(99).toFloat()
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply {
+                topMargin = dp(14)
+                bottomMargin = dp(10)
             }
         }
-        headerRow.addView(titleText)
-        headerRow.addView(statusBadgeText)
-        standbyDashboard.addView(headerRow)
+        cards.addView(buildAirPlayCard(), cardParams())
+        cards.addView(buildWebCard(localIp), cardParams())
+        cards.addView(buildMediaCard(localIp), cardParams())
+        standbyDashboard.addView(cards)
 
-        val cardsContainer = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
-            ).apply {
-                topMargin = dp(18)
-                bottomMargin = dp(14)
-            }
-        }
-
-        val leftCard = createCard().apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                rightMargin = dp(12)
-            }
-        }
-        leftCard.addView(createLabel("PROTOCOLOS NATIVOS ACTIVOS (AIRPLAY 2 + CAST + DLNA)", "#38BDF8"))
-        leftCard.addView(createTitle("1. Duplicar Pantalla desde Mac / iPhone / Android", 18f))
-        leftCard.addView(createBody(
-            "• Mac / iPhone / iPad (AirPlay 2): Centro de Control -> Duplicar Pantalla -> 'OmniCast Google TV' (Puertos 7000/5000/7100 + FairPlay SAP v2.5).\n\n" +
-            "• Mac / Android (Chrome o Brave): Menú [⋮] -> Guardar y compartir -> Transmitir... -> Elige tu Google TV.\n\n" +
-            "• Windows / Android / iOS (DLNA): Detectado en VLC y Galería (SSDP 1900)."
-        ))
-
-        val rightCard = createCard().apply {
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                leftMargin = dp(12)
-            }
-        }
-        rightCard.addView(createLabel("CONSOLA DE DIAGNÓSTICO AIRPLAY EN TIEMPO REAL", "#34D399"))
-        rightCard.addView(createTitle("2. Estado de Conexión y Enlaces Directos", 18f))
-        rightCard.addView(createUrlBox("HTTP (:8080) / HTTPS (:8444):", "http://$localIp:8080  |  https://$localIp:8444", "#34D399"))
-
-        liveLogTextView = TextView(this).apply {
-            text = "Esperando conexión AirPlay desde Mac/iPhone..."
-            setTextColor(Color.parseColor("#38BDF8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            setTypeface(Typeface.MONOSPACE, Typeface.NORMAL)
-            setPadding(dp(12), dp(10), dp(12), dp(10))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.MATCH_PARENT
-            ).apply { topMargin = dp(10) }
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#030712"))
-                setStroke(dp(1), Color.parseColor("#1E293B"))
-                cornerRadius = dp(10).toFloat()
-            }
-        }
-        rightCard.addView(liveLogTextView)
-
-        cardsContainer.addView(leftCard)
-        cardsContainer.addView(rightCard)
-        standbyDashboard.addView(cardsContainer)
-
-        val footerText = TextView(this).apply {
-            text = "Renderizador: Android SurfaceView + MediaCodec Low-Latency · Presiona [BACK] en el control del TV para detener una transmisión"
-            setTextColor(Color.parseColor("#94A3B8"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-        }
-        standbyDashboard.addView(footerText)
+        standbyDashboard.addView(buildFooter())
 
         rootLayout.addView(standbyDashboard, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
@@ -281,6 +224,236 @@ class MainActivity : AppCompatActivity() {
         ))
 
         setContentView(rootLayout)
+    }
+
+    private fun buildHeader(localIp: String): LinearLayout {
+        val header = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        header.addView(ImageView(this).apply {
+            setImageResource(R.drawable.ic_cast_logo)
+            setColorFilter(accentAirPlay)
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply { rightMargin = dp(14) }
+        })
+
+        val titles = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        titles.addView(label("OmniCast", 30f, colorText, bold = true))
+        titles.addView(label("Envía tu pantalla, videos y fotos a esta TV · v${appVersion()}", 13f, colorMuted))
+        header.addView(titles)
+
+        // Píldora de estado con punto que pulsa: indica que la TV está lista para recibir
+        val dot = View(this).apply {
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(accentWeb)
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(10), dp(10)).apply { rightMargin = dp(10) }
+        }
+        pulseAnimator = ObjectAnimator.ofFloat(dot, View.ALPHA, 1f, 0.25f).apply {
+            duration = 1200
+            repeatMode = ValueAnimator.REVERSE
+            repeatCount = ValueAnimator.INFINITE
+            start()
+        }
+        statusBadgeText = label("Lista para conectar · $localIp", 14f, accentWeb, bold = true)
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(8), dp(18), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.parseColor("#1422C55E"))
+                setStroke(dp(1), accentWeb)
+                cornerRadius = dp(99).toFloat()
+            }
+        }
+        pill.addView(dot)
+        pill.addView(statusBadgeText)
+        header.addView(pill)
+        return header
+    }
+
+    private fun buildAirPlayCard(): LinearLayout {
+        val card = methodCard(R.drawable.ic_airplay, accentAirPlay, "Mac · iPhone · iPad", "Duplicar pantalla con AirPlay")
+        card.addView(stepRow(1, "Abre el Centro de control", accentAirPlay))
+        card.addView(stepRow(2, "Toca Duplicar pantalla", accentAirPlay))
+        card.addView(stepRow(3, "Elige «$deviceName»", accentAirPlay))
+        card.addView(spacer())
+        card.addView(chip("Video + audio · sin instalar nada", accentAirPlay))
+        return card
+    }
+
+    private fun buildWebCard(localIp: String): LinearLayout {
+        val url = "https://$localIp:8444"
+        val card = methodCard(R.drawable.ic_monitor, accentWeb, "Windows · Android · Mac", "Desde el navegador")
+        val qr = generateQr(url, dp(120))
+        if (qr != null) {
+            card.addView(ImageView(this).apply {
+                setImageBitmap(qr)
+                setPadding(dp(6), dp(6), dp(6), dp(6))
+                background = GradientDrawable().apply {
+                    setColor(Color.WHITE)
+                    cornerRadius = dp(10).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(132), dp(132)).apply {
+                    gravity = Gravity.CENTER_HORIZONTAL
+                    bottomMargin = dp(6)
+                }
+            })
+        }
+        card.addView(label(url, 15f, accentWeb, bold = true, mono = true).apply { gravity = Gravity.CENTER_HORIZONTAL })
+        card.addView(spacer(dp(6)))
+        card.addView(stepRow(1, "Escanea el QR o abre la dirección en Chrome o Edge", accentWeb))
+        card.addView(stepRow(2, "Acepta el aviso de seguridad y pulsa Compartir pantalla", accentWeb))
+        return card
+    }
+
+    private fun buildMediaCard(localIp: String): LinearLayout {
+        val card = methodCard(R.drawable.ic_movie, accentMedia, "Videos y fotos", "Envía un archivo a la TV")
+        card.addView(stepRow(1, "En el navegador abre http://$localIp:8080", accentMedia))
+        card.addView(stepRow(2, "Elige un video o una foto de tu dispositivo", accentMedia))
+        card.addView(stepRow(3, "Se reproduce en la TV al instante", accentMedia))
+        card.addView(spacer())
+        card.addView(chip("Calidad original · sin comprimir", accentMedia))
+        return card
+    }
+
+    private fun buildFooter(): LinearLayout {
+        val footer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        liveLogTextView = TextView(this).apply {
+            text = "Esperando conexión…"
+            setTextColor(Color.parseColor("#7C8DB5"))
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+            setTypeface(Typeface.MONOSPACE, Typeface.NORMAL)
+            maxLines = 2
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        footer.addView(liveLogTextView)
+        footer.addView(label(
+            "Windows: Win+K (Miracast) no es compatible, usa el navegador  ·  BACK detiene la transmisión",
+            11f, colorMuted
+        ).apply {
+            gravity = Gravity.END
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(16) }
+        })
+        return footer
+    }
+
+    private fun cardParams() = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
+        leftMargin = dp(7)
+        rightMargin = dp(7)
+    }
+
+    private fun methodCard(iconRes: Int, accent: Int, title: String, subtitle: String): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(18), dp(16), dp(18), dp(14))
+            background = GradientDrawable().apply {
+                setColor(colorCard)
+                setStroke(dp(1), colorCardBorder)
+                cornerRadius = dp(18).toFloat()
+            }
+        }
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { bottomMargin = dp(10) }
+        }
+        head.addView(ImageView(this).apply {
+            setImageResource(iconRes)
+            setColorFilter(accent)
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.argb(40, Color.red(accent), Color.green(accent), Color.blue(accent)))
+            }
+            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply { rightMargin = dp(12) }
+        })
+        val texts = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        texts.addView(label(title, 18f, colorText, bold = true))
+        texts.addView(label(subtitle, 12.5f, colorMuted))
+        head.addView(texts)
+        card.addView(head)
+        return card
+    }
+
+    private fun stepRow(n: Int, text: String, accent: Int): LinearLayout {
+        return LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+                .apply { topMargin = dp(7) }
+            addView(TextView(context).apply {
+                this.text = n.toString()
+                setTextColor(colorBg)
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
+                setTypeface(typeface, Typeface.BOLD)
+                gravity = Gravity.CENTER
+                background = GradientDrawable().apply {
+                    shape = GradientDrawable.OVAL
+                    setColor(accent)
+                }
+                layoutParams = LinearLayout.LayoutParams(dp(24), dp(24)).apply { rightMargin = dp(10) }
+            })
+            addView(label(text, 14.5f, colorText).apply {
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            })
+        }
+    }
+
+    private fun chip(text: String, accent: Int): TextView {
+        return label(text, 12f, accent, bold = true).apply {
+            setPadding(dp(12), dp(6), dp(12), dp(6))
+            background = GradientDrawable().apply {
+                setColor(Color.argb(30, Color.red(accent), Color.green(accent), Color.blue(accent)))
+                cornerRadius = dp(99).toFloat()
+            }
+        }
+    }
+
+    private fun label(text: String, sizeSp: Float, color: Int, bold: Boolean = false, mono: Boolean = false): TextView {
+        return TextView(this).apply {
+            this.text = text
+            setTextColor(color)
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
+            if (mono) setTypeface(Typeface.MONOSPACE, if (bold) Typeface.BOLD else Typeface.NORMAL)
+            else if (bold) setTypeface(typeface, Typeface.BOLD)
+        }
+    }
+
+    // Empuja el contenido siguiente hacia abajo (o fija una separación si se indica altura)
+    private fun spacer(height: Int = 0): View {
+        return View(this).apply {
+            layoutParams = if (height > 0) LinearLayout.LayoutParams(1, height)
+            else LinearLayout.LayoutParams(1, 0, 1f)
+        }
+    }
+
+    private fun generateQr(text: String, sizePx: Int): Bitmap? {
+        return try {
+            val hints = mapOf<EncodeHintType, Any>(EncodeHintType.MARGIN to 0)
+            val matrix = QRCodeWriter().encode(text, BarcodeFormat.QR_CODE, sizePx, sizePx, hints)
+            val pixels = IntArray(sizePx * sizePx) { i ->
+                if (matrix.get(i % sizePx, i / sizePx)) Color.BLACK else Color.WHITE
+            }
+            Bitmap.createBitmap(pixels, sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun appVersion(): String {
+        return try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: ""
+        } catch (_: Exception) {
+            ""
+        }
     }
 
     private fun startNativeHardwareMirror(width: Int, height: Int, fps: Int) {
@@ -292,6 +465,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             appendTvLog("Superficie de video no lista: no se puede decodificar")
         }
+
         runOnUiThread {
             exoPlayer?.stop()
             exoPlayerView.visibility = View.GONE
@@ -351,73 +525,6 @@ class MainActivity : AppCompatActivity() {
         return super.onKeyDown(keyCode, event)
     }
 
-    private fun createCard(): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(18), dp(20), dp(18))
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#D9111827"))
-                setStroke(dp(1), Color.parseColor("#1F2937"))
-                cornerRadius = dp(18).toFloat()
-            }
-        }
-    }
-
-    private fun createLabel(textStr: String, colorHex: String): TextView {
-        return TextView(this).apply {
-            text = textStr
-            setTextColor(Color.parseColor(colorHex))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
-            setTypeface(typeface, Typeface.BOLD)
-        }
-    }
-
-    private fun createTitle(textStr: String, sizeSp: Float): TextView {
-        return TextView(this).apply {
-            text = textStr
-            setTextColor(Color.WHITE)
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp)
-            setTypeface(typeface, Typeface.BOLD)
-            setPadding(0, dp(3), 0, dp(6))
-        }
-    }
-
-    private fun createBody(textStr: String): TextView {
-        return TextView(this).apply {
-            text = textStr
-            setTextColor(Color.parseColor("#CBD5E1"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12.5f)
-            setLineSpacing(dp(2).toFloat(), 1f)
-        }
-    }
-
-    private fun createUrlBox(label: String, url: String, colorHex: String): LinearLayout {
-        return LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(12), dp(8), dp(12), dp(8))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(6) }
-            background = GradientDrawable().apply {
-                setColor(Color.parseColor("#030712"))
-                setStroke(dp(1), Color.parseColor("#374151"))
-                cornerRadius = dp(10).toFloat()
-            }
-            addView(TextView(context).apply {
-                text = label
-                setTextColor(Color.parseColor("#94A3B8"))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
-            })
-            addView(TextView(context).apply {
-                text = url
-                setTextColor(Color.parseColor(colorHex))
-                setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f)
-                setTypeface(Typeface.MONOSPACE, Typeface.BOLD)
-            })
-        }
-    }
-
     private fun dp(value: Int): Int {
         return TypedValue.applyDimension(
             TypedValue.COMPLEX_UNIT_DIP,
@@ -457,6 +564,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        pulseAnimator?.cancel()
         h264Decoder?.stop()
         audioPlayer?.stop()
         exoPlayer?.release()
