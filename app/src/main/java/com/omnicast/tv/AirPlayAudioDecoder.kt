@@ -15,6 +15,7 @@ class AirPlayAudioDecoder {
     private var player: LowLatencyAudioPlayer? = null
     private val info = MediaCodec.BufferInfo()
     private var pts = 0L
+    private var pcm = ByteArray(8192)
 
     /** @return null si arrancó bien, o el motivo del fallo para el log. */
     @Synchronized
@@ -50,7 +51,7 @@ class AirPlayAudioDecoder {
     }
 
     @Synchronized
-    fun decode(au: ByteArray, len: Int) {
+    fun decode(au: ByteArray, offset: Int, len: Int) {
         val c = codec ?: return
         try {
             val inIdx = c.dequeueInputBuffer(5000)
@@ -58,7 +59,7 @@ class AirPlayAudioDecoder {
                 val buf = c.getInputBuffer(inIdx) ?: return
                 buf.clear()
                 val n = minOf(len, buf.remaining())
-                buf.put(au, 0, n)
+                buf.put(au, offset, n)
                 c.queueInputBuffer(inIdx, 0, n, pts, 0)
                 pts += 10_000L // 480 muestras @ 44.1 kHz ≈ 10.9 ms; el pts no afecta a la salida PCM
             }
@@ -67,10 +68,10 @@ class AirPlayAudioDecoder {
                 if (outIdx < 0) break
                 val out = c.getOutputBuffer(outIdx)
                 if (out != null && info.size > 0) {
-                    val pcm = ByteArray(info.size)
+                    if (pcm.size < info.size) pcm = ByteArray(info.size)
                     out.position(info.offset)
-                    out.get(pcm)
-                    player?.writePcm(pcm, 0, pcm.size)
+                    out.get(pcm, 0, info.size)
+                    player?.writePcm(pcm, 0, info.size)
                 }
                 c.releaseOutputBuffer(outIdx, false)
             }

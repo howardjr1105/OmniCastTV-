@@ -94,8 +94,8 @@ class AirPlayBonjourService(
     @Volatile private var nextDecryptCount = 0
 
     private val audioDecoder = AirPlayAudioDecoder()
-    @Volatile private var audioKey: ByteArray? = null
-    @Volatile private var audioIv: ByteArray? = null
+    @Volatile private var audioKey: SecretKeySpec? = null
+    @Volatile private var audioIv: IvParameterSpec? = null
 
     private fun logTv(msg: String) {
         Log.i("AirPlayService", msg)
@@ -564,8 +564,8 @@ class AirPlayBonjourService(
         val sha512 = MessageDigest.getInstance("SHA-512")
         sha512.update(key)
         sha512.update(secret)
-        audioKey = sha512.digest().copyOfRange(0, 16)
-        audioIv = iv
+        audioKey = SecretKeySpec(sha512.digest().copyOfRange(0, 16), "AES")
+        audioIv = IvParameterSpec(iv)
     }
 
     private fun receiveAudioLoop(socket: DatagramSocket) {
@@ -581,18 +581,19 @@ class AirPlayBonjourService(
             val key = audioKey ?: continue
             val iv = audioIv ?: continue
             try {
-                val payload = buf.copyOfRange(12, len)
+                // Descifrado in-place sobre el buffer del socket (sin copias por paquete).
                 // Solo se cifran los bloques completos de 16B; el resto viaja en claro. El IV se reinicia en cada paquete
-                val encLen = (payload.size / 16) * 16
+                val payloadLen = len - 12
+                val encLen = (payloadLen / 16) * 16
                 if (encLen > 0) {
-                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
-                    cipher.update(payload, 0, encLen, payload, 0)
+                    cipher.init(Cipher.DECRYPT_MODE, key, iv)
+                    cipher.update(buf, 12, encLen, buf, 12)
                 }
                 if (!logged) {
                     logged = true
-                    logTv("Primer paquete de audio recibido (${payload.size}B)")
+                    logTv("Primer paquete de audio recibido (${payloadLen}B)")
                 }
-                audioDecoder.decode(payload, payload.size)
+                audioDecoder.decode(buf, 12, payloadLen)
             } catch (e: Throwable) {
                 if (!logged) {
                     logged = true

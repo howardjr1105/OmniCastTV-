@@ -105,6 +105,7 @@ class MainActivity : AppCompatActivity() {
             httpsPort = 8444,
             onStartH264Mirror = { w, h, fps ->
                 startNativeHardwareMirror(w, h, fps)
+                audioPlayer?.start(48000) // solo el emisor web manda PCM 48 kHz; AirPlay usa su propio player
             },
             onH264NalPacket = { nal ->
                 h264Decoder?.pushNalUnit(nal)
@@ -291,8 +292,6 @@ class MainActivity : AppCompatActivity() {
         } else {
             appendTvLog("Superficie de video no lista: no se puede decodificar")
         }
-        audioPlayer?.start(48000)
-
         runOnUiThread {
             exoPlayer?.stop()
             exoPlayerView.visibility = View.GONE
