@@ -17,8 +17,8 @@ android {
         applicationId = "com.omnicast.tv"
         minSdk = 24
         targetSdk = 34
-        versionCode = 11
-        versionName = "2.7.0-Native"
+        versionCode = 12
+        versionName = "2.8.0-Native"
     }
 
     // Keystore fija (secreto de CI) para que cada versión se instale encima de la anterior sin desinstalar.

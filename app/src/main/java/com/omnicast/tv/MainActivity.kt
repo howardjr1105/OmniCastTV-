@@ -3,11 +3,13 @@ package com.omnicast.tv
 import android.animation.ObjectAnimator
 import android.animation.ValueAnimator
 import android.content.Context
+import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
@@ -272,8 +274,33 @@ class MainActivity : AppCompatActivity() {
         }
         pill.addView(dot)
         pill.addView(statusBadgeText)
+        header.addView(xboxButton())
         header.addView(pill)
         return header
+    }
+
+    // Acceso directo a Xbox Cloud Gaming: enfocable con el mando de la TV y seleccionado al abrir la app
+    private fun xboxButton(): TextView {
+        fun shape(fill: Int, stroke: Int, strokeDp: Int) = GradientDrawable().apply {
+            setColor(fill)
+            setStroke(dp(strokeDp), stroke)
+            cornerRadius = dp(99).toFloat()
+        }
+        return label("Xbox Cloud Gaming", 14f, Color.WHITE, bold = true).apply {
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(18), dp(8), dp(18), dp(8))
+            isFocusable = true
+            background = StateListDrawable().apply {
+                addState(intArrayOf(android.R.attr.state_focused), shape(Color.parseColor("#17A317"), Color.WHITE, 3))
+                addState(intArrayOf(), shape(Color.parseColor("#107C10"), Color.parseColor("#2AA02A"), 1))
+            }
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { rightMargin = dp(14) }
+            setOnClickListener { startActivity(Intent(this@MainActivity, XboxCloudActivity::class.java)) }
+            post { requestFocus() }
+        }
     }
 
     private fun buildAirPlayCard(): LinearLayout {

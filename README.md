@@ -27,6 +27,9 @@ Se envía video y audio. La TV y el dispositivo deben estar en la misma red Wi-F
 2. Elige un archivo de tu dispositivo.
 3. Se reproduce en la TV con su calidad original.
 
+### Xbox Cloud Gaming (experimental)
+En la pantalla de inicio, el botón verde **Xbox Cloud Gaming** abre `xbox.com/play` dentro de la app, con el WebView del sistema y el perfil de navegador que usa Better xCloud en Android TV. Empareja un mando Bluetooth en *Ajustes → Mandos y accesorios*, inicia sesión con tu cuenta de Microsoft y necesitas Xbox Game Pass. Con el botón BACK vuelves a OmniCast. No es una función oficial de Microsoft y puede dejar de funcionar si cambian la web.
+
 > **Windows y Miracast.** La proyección nativa de Windows (**Win+K** / *Conectar a pantalla inalámbrica*) **no es compatible**. Miracast exige que el receptor use Wi-Fi Direct, y no todas las TV con Android lo tienen (por ejemplo, el Chromecast HD no). Android tampoco permite que una app actúe como receptor Miracast. En Windows usa el navegador, como se explica arriba.
 
 ---
