@@ -93,6 +93,10 @@ class AirPlayBonjourService(
     private val ogBlock = ByteArray(16)
     @Volatile private var nextDecryptCount = 0
 
+    private val audioDecoder = AirPlayAudioDecoder()
+    @Volatile private var audioKey: ByteArray? = null
+    @Volatile private var audioIv: ByteArray? = null
+
     private fun logTv(msg: String) {
         Log.i("AirPlayService", msg)
         onLogEvent(msg)
@@ -191,8 +195,9 @@ class AirPlayBonjourService(
 
         executor.execute {
             try {
-                audioDataUdp7103 = DatagramSocket(7103).apply { reuseAddress = true }
                 audioCtrlUdp7104 = DatagramSocket(7104).apply { reuseAddress = true }
+                audioDataUdp7103 = DatagramSocket(7103).apply { reuseAddress = true }
+                receiveAudioLoop(audioDataUdp7103!!)
             } catch (_: Throwable) {}
         }
 
@@ -422,12 +427,16 @@ class AirPlayBonjourService(
                                                     logTv("SETUP Video Stream (type=110) -> puerto TCP 7100")
                                                 }
                                                 96 -> {
+                                                    val ct = (streamDict["ct"] as? NSNumber)?.intValue() ?: 8
+                                                    initAudioCipher()
+                                                    val audioErr = audioDecoder.start(ct)
                                                     val aStream = NSDictionary()
                                                     aStream["type"] = NSNumber(96)
                                                     aStream["dataPort"] = NSNumber(7103)
                                                     aStream["controlPort"] = NSNumber(7104)
                                                     outList.add(aStream)
-                                                    logTv("SETUP Audio Stream (type=96) -> puertos UDP 7103/7104")
+                                                    logTv("SETUP Audio Stream (type=96 ct=$ct key=${audioKey != null}) -> UDP 7103/7104" +
+                                                        (audioErr?.let { " ERR $it" } ?: ""))
                                                 }
                                                 else -> {
                                                     val genericStream = NSDictionary()
@@ -483,6 +492,7 @@ class AirPlayBonjourService(
                     }
 
                     path.startsWith("/stop") || method == "TEARDOWN" -> {
+                        audioDecoder.stop()
                         sendResponse(output, "200 OK", "text/plain", ByteArray(0), cseq)
                     }
 
@@ -538,6 +548,57 @@ class AirPlayBonjourService(
         } catch (e: Throwable) {
             cipherDiag += " AES ERR ${e.message}"
             logTv("Error iniciando AES-CTR: ${e.message}")
+        }
+    }
+
+    // Misma derivación que el video: eadc = SHA-512(aesKey ‖ ecdhSecret)[0..16]; el IV es el eiv del SETUP
+    private fun initAudioCipher() {
+        val key = rawFairPlayAesKey
+        val secret = sharedSecret
+        val iv = setupEiv
+        if (key == null || secret == null || iv == null) {
+            audioKey = null
+            audioIv = null
+            return
+        }
+        val sha512 = MessageDigest.getInstance("SHA-512")
+        sha512.update(key)
+        sha512.update(secret)
+        audioKey = sha512.digest().copyOfRange(0, 16)
+        audioIv = iv
+    }
+
+    private fun receiveAudioLoop(socket: DatagramSocket) {
+        val buf = ByteArray(2048)
+        val pkt = DatagramPacket(buf, buf.size)
+        val cipher = Cipher.getInstance("AES/CBC/NoPadding")
+        var logged = false
+        while (isRunning) {
+            pkt.length = buf.size
+            socket.receive(pkt)
+            val len = pkt.length
+            if (len <= 12 || (buf[1].toInt() and 0x7F) != 0x60) continue
+            val key = audioKey ?: continue
+            val iv = audioIv ?: continue
+            try {
+                val payload = buf.copyOfRange(12, len)
+                // Solo se cifran los bloques completos de 16B; el resto viaja en claro. El IV se reinicia en cada paquete
+                val encLen = (payload.size / 16) * 16
+                if (encLen > 0) {
+                    cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), IvParameterSpec(iv))
+                    cipher.update(payload, 0, encLen, payload, 0)
+                }
+                if (!logged) {
+                    logged = true
+                    logTv("Primer paquete de audio recibido (${payload.size}B)")
+                }
+                audioDecoder.decode(payload, payload.size)
+            } catch (e: Throwable) {
+                if (!logged) {
+                    logged = true
+                    logTv("Error audio: ${e.javaClass.simpleName} ${e.message}")
+                }
+            }
         }
     }
 
@@ -638,6 +699,7 @@ class AirPlayBonjourService(
             try { socket.close() } catch (_: Throwable) {}
             if (mirrorSocket === socket) {
                 mirrorSocket = null
+                audioDecoder.stop()
                 onStop()
             }
         }
@@ -785,6 +847,7 @@ class AirPlayBonjourService(
         try { timingUdp7102?.close() } catch (_: Throwable) {}
         try { audioDataUdp7103?.close() } catch (_: Throwable) {}
         try { audioCtrlUdp7104?.close() } catch (_: Throwable) {}
+        audioDecoder.stop()
         try {
             jmdns?.unregisterAllServices()
             jmdns?.close()
