@@ -87,11 +87,20 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val localCodec = codec ?: return@Thread
                 val info = MediaCodec.BufferInfo()
+                var delayMs = DEFAULT_VIDEO_DELAY_MS
+                var lastReadMs = 0L
                 while (isRunning) {
                     try {
                         val outIdx = localCodec.dequeueOutputBuffer(info, 10000)
                         if (outIdx >= 0) {
-                            localCodec.releaseOutputBuffer(outIdx, true)
+                            // El audio llega por la TV con más latencia (colchón + mezclador + HDMI): se retrasa el video para igualarlo
+                            val now = System.nanoTime() / 1_000_000
+                            if (now - lastReadMs > 1000) {
+                                lastReadMs = now
+                                delayMs = readDelayMs() ?: delayMs
+                            }
+                            if (delayMs > 0) localCodec.releaseOutputBuffer(outIdx, System.nanoTime() + delayMs * 1_000_000L)
+                            else localCodec.releaseOutputBuffer(outIdx, true)
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
@@ -106,6 +115,16 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
             Log.e("HardwareH264Decoder", "Error al iniciar MediaCodec: ${e.message}")
             onError("Error iniciando MediaCodec: ${e.message}")
         }
+    }
+
+    // Calibración sin recompilar: adb shell "echo 150 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms" (se relee cada 1 s)
+    private fun readDelayMs(): Long? = try {
+        java.io.File(DELAY_FILE).readText().trim().toLong().coerceIn(0, 600)
+    } catch (_: Exception) { null }
+
+    private companion object {
+        const val DELAY_FILE = "/sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
+        const val DEFAULT_VIDEO_DELAY_MS = 120L // ponytail: estimación (preroll 80 ms + mezclador TV); calibrar con el archivo de arriba
     }
 
     fun pushNalUnit(nalData: ByteArray) {

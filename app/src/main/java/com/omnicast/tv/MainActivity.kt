@@ -64,7 +64,11 @@ class MainActivity : AppCompatActivity() {
 
     @Volatile private var surfaceReady = false
 
-    private val deviceName = "OmniCast Google TV"
+    // Nombre que el usuario le puso a la TV (Ajustes > Acerca de); es lo que ve en el menú de duplicar de la Mac
+    private val deviceName: String by lazy {
+        android.provider.Settings.Global.getString(contentResolver, "device_name")?.takeIf { it.isNotBlank() }
+            ?: android.os.Build.MODEL
+    }
 
     // Paleta de la pantalla de inicio (fondo oscuro; un color de acento por método de conexión)
     private val colorText = Color.parseColor("#F8FAFC")
