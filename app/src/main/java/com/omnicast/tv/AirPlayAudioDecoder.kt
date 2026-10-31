@@ -15,6 +15,7 @@ class AirPlayAudioDecoder {
     private var player: LowLatencyAudioPlayer? = null
     private val info = MediaCodec.BufferInfo()
     private var pts = 0L
+    private var lastSeq = -1
     private var pcm = ByteArray(8192)
 
     /** @return null si arrancó bien, o el motivo del fallo para el log. */
@@ -42,6 +43,7 @@ class AirPlayAudioDecoder {
             }
             player = LowLatencyAudioPlayer().also { it.start(44100) }
             pts = 0L
+            lastSeq = -1
             null
         } catch (e: Throwable) {
             Log.e("AirPlayAudio", "Error iniciando decoder AAC: ${e.message}")
@@ -50,9 +52,15 @@ class AirPlayAudioDecoder {
         }
     }
 
+    /** @param seq número de secuencia RTP: AAC-ELD es con estado, un paquete duplicado o tardío corrompe lo siguiente. */
     @Synchronized
-    fun decode(au: ByteArray, offset: Int, len: Int) {
+    fun decode(au: ByteArray, offset: Int, len: Int, seq: Int) {
         val c = codec ?: return
+        if (lastSeq >= 0) {
+            val d = (seq - lastSeq) and 0xFFFF
+            if (d == 0 || d > 0x8000) return
+        }
+        lastSeq = seq
         try {
             val inIdx = c.dequeueInputBuffer(5000)
             if (inIdx >= 0) {

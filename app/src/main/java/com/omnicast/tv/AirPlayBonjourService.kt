@@ -581,6 +581,9 @@ class AirPlayBonjourService(
     }
 
     private fun receiveAudioLoop(socket: DatagramSocket) {
+        // Con el decodificador de video compitiendo por CPU, un hilo de prioridad normal pierde paquetes y deja sin datos al AudioTrack
+        android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
+        try { socket.receiveBufferSize = 256 * 1024 } catch (_: Throwable) {}
         val buf = ByteArray(2048)
         val pkt = DatagramPacket(buf, buf.size)
         val cipher = Cipher.getInstance("AES/CBC/NoPadding")
@@ -605,7 +608,8 @@ class AirPlayBonjourService(
                     logged = true
                     logTv("Primer paquete de audio recibido (${payloadLen}B)")
                 }
-                audioDecoder.decode(buf, 12, payloadLen)
+                val seq = ((buf[2].toInt() and 0xFF) shl 8) or (buf[3].toInt() and 0xFF)
+                audioDecoder.decode(buf, 12, payloadLen, seq)
             } catch (e: Throwable) {
                 if (!logged) {
                     logged = true
