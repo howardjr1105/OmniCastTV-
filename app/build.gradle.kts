@@ -125,6 +125,16 @@ val injectFairPlayEngine by tasks.registering {
                                         }
                                         // Hacer públicos los métodos package-private en FairPlay.java
                                         if (className == "FairPlay") {
+                                            // InputStream.readAllBytes() es Java 9 / API 33: en Android 11 lanza NoSuchMethodError en /fp-setup
+                                            content = content.replace(
+                                                "byte[] data = request.readAllBytes();",
+                                                "java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();\n" +
+                                                "        byte[] tmp = new byte[1024];\n" +
+                                                "        int n;\n" +
+                                                "        while ((n = request.read(tmp)) != -1) bos.write(tmp, 0, n);\n" +
+                                                "        byte[] data = bos.toByteArray();"
+                                            )
+                                            require(!content.contains("readAllBytes")) { "FairPlay.java aún usa readAllBytes (API 33+)" }
                                             content = content.replace(
                                                 Regex("(?m)^(\\s+)(void\\s+fairPlaySetup)"),
                                                 "$1public $2"
