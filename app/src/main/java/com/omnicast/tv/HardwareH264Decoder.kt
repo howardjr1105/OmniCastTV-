@@ -4,6 +4,7 @@ import android.media.MediaCodec
 import android.media.MediaFormat
 import android.os.Build
 import android.os.Process
+import android.os.SystemClock
 import android.util.Log
 import android.view.Surface
 import java.util.concurrent.LinkedBlockingDeque
@@ -17,7 +18,11 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
 
     private var codec: MediaCodec? = null
     @Volatile private var isRunning = false
-    private val nalQueue = LinkedBlockingDeque<ByteArray>(180)
+    private class Nal(val data: ByteArray, val atMs: Long)
+    private val nalQueue = LinkedBlockingDeque<Nal>(180)
+    @Volatile private var framesIn = 0
+    @Volatile private var framesOut = 0
+    @Volatile private var framesDropped = 0
     @Volatile private var cachedConfigNal: ByteArray? = null
     private var inputThread: Thread? = null
     private var outputThread: Thread? = null
@@ -28,7 +33,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, maxOf(width * height, 4 * 1024 * 1024))
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 2 * 1024 * 1024) // 4 MB × N buffers es mucho en una TV de <1 GB de RAM
                 setInteger(MediaFormat.KEY_PRIORITY, 0)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                     setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
@@ -42,16 +47,28 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
             isRunning = true
 
             // Si ya había llegado un paquete SPS/PPS mientras arrancaba el codec, encolarlo de primero
-            cachedConfigNal?.let { nalQueue.offerFirst(it) }
+            cachedConfigNal?.let { nalQueue.offerFirst(Nal(it, 0)) }
 
             // Hilo de inyección de NAL units al hardware
             inputThread = Thread({
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val localCodec = codec ?: return@Thread
                 var pts = 0L
+                var delayMs = DEFAULT_VIDEO_DELAY_MS
+                var lastReadMs = 0L
                 while (isRunning) {
                     try {
-                        val nal = nalQueue.poll(15, TimeUnit.MILLISECONDS) ?: continue
+                        val item = nalQueue.poll(15, TimeUnit.MILLISECONDS) ?: continue
+                        val nal = item.data
+                        // Línea de retardo ANTES del decodificador (datos comprimidos, casi gratis): retener cuadros ya
+                        // decodificados agota los pocos buffers de salida del OMX de esta TV y la imagen se arrastra.
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastReadMs > 1000) {
+                            lastReadMs = now
+                            delayMs = readDelayMs() ?: delayMs
+                        }
+                        val wait = item.atMs + delayMs - now
+                        if (item.atMs > 0 && wait > 0) Thread.sleep(wait)
                         // Nunca descartar un cuadro: perder un P-frame corrompe la imagen hasta el siguiente IDR
                         var inIdx = -1
                         while (isRunning && inIdx < 0) inIdx = localCodec.dequeueInputBuffer(10000)
@@ -71,6 +88,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                                 localCodec.queueInputBuffer(inIdx, 0, len, pts, flags)
                                 if (nalType != 7 && nalType != 8) {
                                     pts += 16666L
+                                    framesIn++
                                 }
                             }
                         }
@@ -87,20 +105,19 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val localCodec = codec ?: return@Thread
                 val info = MediaCodec.BufferInfo()
-                var delayMs = DEFAULT_VIDEO_DELAY_MS
-                var lastReadMs = 0L
+                var lastStatsMs = SystemClock.elapsedRealtime()
                 while (isRunning) {
                     try {
                         val outIdx = localCodec.dequeueOutputBuffer(info, 10000)
                         if (outIdx >= 0) {
-                            // El audio llega por la TV con más latencia (colchón + mezclador + HDMI): se retrasa el video para igualarlo
-                            val now = System.nanoTime() / 1_000_000
-                            if (now - lastReadMs > 1000) {
-                                lastReadMs = now
-                                delayMs = readDelayMs() ?: delayMs
-                            }
-                            if (delayMs > 0) localCodec.releaseOutputBuffer(outIdx, System.nanoTime() + delayMs * 1_000_000L)
-                            else localCodec.releaseOutputBuffer(outIdx, true)
+                            localCodec.releaseOutputBuffer(outIdx, true)
+                            framesOut++
+                        }
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastStatsMs >= 5000) {
+                            Log.i("HardwareH264Decoder", "5s: in=$framesIn out=$framesOut dropped=$framesDropped queue=${nalQueue.size}")
+                            framesIn = 0; framesOut = 0; framesDropped = 0
+                            lastStatsMs = now
                         }
                     } catch (e: Exception) {
                         if (!isRunning) break
@@ -124,7 +141,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
 
     private companion object {
         const val DELAY_FILE = "/sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
-        const val DEFAULT_VIDEO_DELAY_MS = 120L // ponytail: estimación (preroll 80 ms + mezclador TV); calibrar con el archivo de arriba
+        const val DEFAULT_VIDEO_DELAY_MS = 50L // ponytail: estimación (preroll de audio + mezclador TV); calibrar con el archivo de arriba
     }
 
     fun pushNalUnit(nalData: ByteArray) {
@@ -140,10 +157,11 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 nalQueue.pollLast()
             } else {
                 // Descartar solo este P-frame entrante sin borrar jamás el SPS/PPS ni el IDR del frente
+                framesDropped++
                 return
             }
         }
-        nalQueue.offerLast(nalData)
+        nalQueue.offerLast(Nal(nalData, SystemClock.elapsedRealtime()))
     }
 
     private fun findFirstNalType(data: ByteArray): Int {

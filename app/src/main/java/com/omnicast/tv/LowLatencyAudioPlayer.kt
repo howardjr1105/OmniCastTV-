@@ -100,6 +100,6 @@ class LowLatencyAudioPlayer {
 
     private companion object {
         const val BUFFER_MS = 300
-        const val PREROLL_MS = 80 // ponytail: fijo; subir si sigue cortándose en Wi-Fi malo, o hacerlo adaptativo
+        const val PREROLL_MS = 50// ponytail: fijo; subir si sigue cortándose en Wi-Fi malo, o hacerlo adaptativo
     }
 }
