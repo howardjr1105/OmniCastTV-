@@ -117,19 +117,19 @@ El mismo nombre se usa en AirPlay (`_airplay._tcp` y `_raop._tcp`), en DLNA y en
 
 ### Sincronía de audio y video
 
-El video se retrasa unos milisegundos para igualarlo al audio, que en la TV pasa por el colchón anti-jitter, el mezclador de Android y la salida HDMI. El valor inicial es **50 ms** y es una estimación: cada TV tiene una latencia de audio distinta.
+La sincronía es **automática**. La Mac marca cada cuadro de video con su hora (NTP) y manda paquetes que ligan el audio a esa misma hora. La app compara cuándo llega cada uno, suma la latencia real de salida del audio (colchón + mezclador de Android + HDMI, medida con `AudioTrack.getTimestamp`) y la del decodificador de video, y retrasa el video lo justo. El retraso se ajusta poco a poco (3 ms por cuadro) para que no haya saltos. Mientras no haya audio, se usa un retraso de 50 ms.
 
-Para calibrar mientras duplicas, sin recompilar (el valor se relee cada segundo):
+Si aun así notas un desfase constante en tu TV, puedes sumar o restar milisegundos a lo medido, sin recompilar (se relee cada segundo):
 
 ```bash
 adb shell "mkdir -p /sdcard/Android/data/com.omnicast.tv/files"
-adb shell "echo 120 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
+adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 ```
 
-- Si el **audio llega tarde** respecto a la imagen, **sube** el número.
-- Si el **audio se oye antes** que la imagen, **bájalo**. Con `0` el video no se retrasa.
-- Rango permitido: 0 a 600 ms. Cada milisegundo añade esa misma latencia a la imagen.
-- Para volver al valor por defecto, borra el archivo: `adb shell rm /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms`.
+- Si el **audio llega tarde** respecto a la imagen, usa un número **positivo** (retrasa más el video).
+- Si el **audio se oye antes** que la imagen, usa un número **negativo**, por ejemplo `-40`.
+- Rango permitido: -300 a 600 ms.
+- Para quitar el ajuste, borra el archivo: `adb shell rm /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms`.
 
 ### Constantes en el código
 
@@ -137,7 +137,8 @@ adb shell "echo 120 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 |---|---|---|---|
 | `PREROLL_MS` | `LowLatencyAudioPlayer.kt` | 50 | Audio acumulado antes de empezar a sonar. Súbelo si hay cortes en Wi-Fi malo; bájalo para menos retardo. |
 | `BUFFER_MS` | `LowLatencyAudioPlayer.kt` | 300 | Tamaño del buffer del `AudioTrack`. |
-| `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video por defecto. |
+| `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video mientras `AvSync` aún no tiene datos de audio. |
+| `MAX_DELAY_MS` / `SLEW_MS` | `HardwareH264Decoder.kt` | 800 / 3 | Tope del retardo y ritmo con que se acerca al objetivo. |
 | Resolución y fps anunciados | `AirPlayBonjourService.kt` | 1920×1080 a 60 | Lo que la Mac cree que soporta la TV. |
 
 ---
@@ -180,6 +181,7 @@ Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con meno
 - `AudioTrack` con buffer de **300 ms** y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz) y cualquier ráfaga de Wi-Fi producía chasquidos.
 - **Colchón anti-jitter:** el audio empieza a sonar con `PREROLL_MS` acumulados. Si el buffer se vacía, se pausa y vuelve a llenar, en lugar de seguir a trompicones.
 - **Paquetes RTP:** AAC-ELD es un códec con estado, así que un paquete duplicado o tardío corrompe lo que sigue. Se descartan por número de secuencia.
+- **`WifiLock` en modo de baja latencia** mientras la app está abierta. Sin él, el Wi-Fi de la TV entra en ahorro de energía y el tráfico llega a ráfagas (en una TV de prueba, el ping en reposo variaba entre 4 y 69 ms), lo que se oye como microcortes.
 - **Hilo de audio con prioridad `URGENT_AUDIO`** y buffer de socket UDP de 256 KB, para que el decodificador de video no le quite CPU.
 
 **Video**
@@ -211,12 +213,17 @@ La pantalla de inicio de la TV también muestra los últimos eventos al pie.
 | `HardwareH264Decoder` | `in` / `out` | Cuadros enviados al decodificador y cuadros mostrados en 5 s. Si `out` es mucho menor que `in`, el decodificador no da abasto. |
 | | `dropped` | Cuadros descartados porque la cola estaba llena. |
 | | `queue` | Cuadros esperando. Si crece sin parar, la TV no puede con el flujo. |
+| | `kbps` | Tasa de video que manda la Mac. En Wi-Fi de 2,4 GHz, valores altos y sostenidos saturan el enlace. |
+| | `applied` | Retraso de video que se está aplicando ahora. |
+| | `vMin` / `aMin` | Tránsito mínimo medido de video y de audio (ms, incluye la diferencia de relojes con la Mac). |
+| | `audioOut` / `dec` | Latencia de salida del audio y del decodificador de video. |
+| | `target` | Retraso de video calculado. `-` significa que aún faltan datos (por ejemplo, no ha empezado el audio). |
 
 ### Problemas comunes
 
 - **La TV no aparece en AirPlay:** comprueba que ambos estén en la misma red y que el router no tenga *aislamiento de clientes* (AP isolation) ni bloquee mDNS/multicast. Desde la Mac puedes comprobarlo con `dns-sd -B _airplay._tcp local.`
 - **Aparece con otro nombre:** el nombre sale de *Ajustes → Acerca de → Nombre del dispositivo* de la TV. Ver [Configuración](#nombre-de-la-tv-en-el-menú-de-duplicar).
-- **El audio suena con cortes o chasquidos:** mira `rearms` y `underrunsTrack` en el log. Si suben, sube `PREROLL_MS`, acerca la TV al router o usa la banda de 5 GHz.
+- **El audio suena con cortes o chasquidos:** mira `rearms` y `underrunsTrack` en el log. Si suben, sube `PREROLL_MS`, acerca la TV al router y, si la TV lo permite, conéctala por **cable Ethernet** o a la banda de **5 GHz**. Muchas TV solo tienen Wi-Fi n de 2,4 GHz, que se satura con 1080p a 60 fps.
 - **El audio no va sincronizado con la imagen:** calibra `av_delay_ms`. Ver [Sincronía de audio y video](#sincronía-de-audio-y-video).
 - **La imagen se ve lenta o entrecortada:** mira `in`, `out` y `queue` de `HardwareH264Decoder`. Si `out` es mucho menor que `in`, el decodificador de la TV no da abasto con 1080p a 60 fps. Prueba con `av_delay_ms` en `0` para descartar el retardo.
 - **En la Mac se queda en modo *Extender* y no deja pasar a *Duplicar*:** cambia el modo en *Ajustes del Sistema → Pantallas*, o desconecta y vuelve a conectar la duplicación.
@@ -258,6 +265,7 @@ La tarea `injectFairPlayEngine` descarga en `preBuild` el motor FairPlay de [`se
 | `AirPlayBonjourService.kt` | AirPlay: anuncio mDNS, RTSP, emparejamiento, FairPlay, video y audio |
 | `AirPlayAudioDecoder.kt` | Decodifica el audio AAC (ELD/LC) de AirPlay y descarta paquetes fuera de orden |
 | `HardwareH264Decoder.kt` | Decodificador H.264 por hardware (MediaCodec), línea de retardo A/V y estadísticas |
+| `AvSync.kt` | Calcula el retardo de video a partir de las marcas de tiempo de video y audio |
 | `LowLatencyAudioPlayer.kt` | Reproducción de audio PCM con colchón anti-jitter |
 | `NativeStreamServer.kt` | Servidor HTTP/HTTPS + WebSocket del emisor web y subida de archivos |
 | `DlnaSsdpService.kt` | Descubrimiento DLNA/UPnP |

@@ -23,6 +23,9 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
     @Volatile private var framesIn = 0
     @Volatile private var framesOut = 0
     @Volatile private var framesDropped = 0
+    @Volatile private var bytesIn = 0L
+    @Volatile private var appliedMs = 0L
+    private val handedAt = LongArray(64) // instante en que cada cuadro entró al decodificador, indexado por pts
     @Volatile private var cachedConfigNal: ByteArray? = null
     private var inputThread: Thread? = null
     private var outputThread: Thread? = null
@@ -45,6 +48,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 start()
             }
             isRunning = true
+            AvSync.resetVideo()
 
             // Si ya había llegado un paquete SPS/PPS mientras arrancaba el codec, encolarlo de primero
             cachedConfigNal?.let { nalQueue.offerFirst(Nal(it, 0)) }
@@ -54,8 +58,9 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_DISPLAY)
                 val localCodec = codec ?: return@Thread
                 var pts = 0L
-                var delayMs = DEFAULT_VIDEO_DELAY_MS
+                var trimMs = 0L
                 var lastReadMs = 0L
+                appliedMs = 0
                 while (isRunning) {
                     try {
                         val item = nalQueue.poll(15, TimeUnit.MILLISECONDS) ?: continue
@@ -65,9 +70,13 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastReadMs > 1000) {
                             lastReadMs = now
-                            delayMs = readDelayMs() ?: delayMs
+                            trimMs = readTrimMs() ?: trimMs
                         }
-                        val wait = item.atMs + delayMs - now
+                        // Objetivo medido por AvSync (o el valor por defecto si aún no hay datos) + ajuste manual.
+                        // Se acerca de a SLEW_MS por cuadro para que el video se acelere o frene sin saltos.
+                        val target = ((AvSync.targetDelayMs() ?: DEFAULT_VIDEO_DELAY_MS) + trimMs).coerceIn(0, MAX_DELAY_MS)
+                        appliedMs += (target - appliedMs).coerceIn(-SLEW_MS, SLEW_MS)
+                        val wait = item.atMs + appliedMs - now
                         if (item.atMs > 0 && wait > 0) Thread.sleep(wait)
                         // Nunca descartar un cuadro: perder un P-frame corrompe la imagen hasta el siguiente IDR
                         var inIdx = -1
@@ -86,6 +95,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                                     else -> 0
                                 }
                                 localCodec.queueInputBuffer(inIdx, 0, len, pts, flags)
+                                handedAt[((pts / 16666) % 64).toInt()] = SystemClock.elapsedRealtime()
                                 if (nalType != 7 && nalType != 8) {
                                     pts += 16666L
                                     framesIn++
@@ -110,12 +120,16 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                     try {
                         val outIdx = localCodec.dequeueOutputBuffer(info, 10000)
                         if (outIdx >= 0) {
+                            val d = SystemClock.elapsedRealtime() - handedAt[((info.presentationTimeUs / 16666) % 64).toInt()]
+                            if (d in 0..400) AvSync.decodeMs = (AvSync.decodeMs * 7 + d) / 8
                             localCodec.releaseOutputBuffer(outIdx, true)
                             framesOut++
                         }
                         val now = SystemClock.elapsedRealtime()
                         if (now - lastStatsMs >= 5000) {
-                            Log.i("HardwareH264Decoder", "5s: in=$framesIn out=$framesOut dropped=$framesDropped queue=${nalQueue.size}")
+                            Log.i("HardwareH264Decoder", "5s: in=$framesIn out=$framesOut dropped=$framesDropped queue=${nalQueue.size} " +
+                                "kbps=${bytesIn * 8 / 5000} applied=${appliedMs}ms ${AvSync.debug()}")
+                            bytesIn = 0
                             framesIn = 0; framesOut = 0; framesDropped = 0
                             lastStatsMs = now
                         }
@@ -134,14 +148,17 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
         }
     }
 
-    // Calibración sin recompilar: adb shell "echo 150 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms" (se relee cada 1 s)
-    private fun readDelayMs(): Long? = try {
-        java.io.File(DELAY_FILE).readText().trim().toLong().coerceIn(0, 600)
+    // Ajuste fino sin recompilar, en ms con signo, se SUMA al retraso medido:
+    //   adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"   (se relee cada 1 s)
+    private fun readTrimMs(): Long? = try {
+        java.io.File(DELAY_FILE).readText().trim().toLong().coerceIn(-300, 600)
     } catch (_: Exception) { null }
 
     private companion object {
         const val DELAY_FILE = "/sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
-        const val DEFAULT_VIDEO_DELAY_MS = 50L // ponytail: estimación (preroll de audio + mezclador TV); calibrar con el archivo de arriba
+        const val DEFAULT_VIDEO_DELAY_MS = 50L // solo mientras AvSync no tiene datos (p. ej. antes de que empiece el audio)
+        const val MAX_DELAY_MS = 800L
+        const val SLEW_MS = 3L
     }
 
     fun pushNalUnit(nalData: ByteArray) {
@@ -151,6 +168,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
             cachedConfigNal = nalData
         }
         if (!isRunning) return
+        bytesIn += nalData.size
 
         if (nalQueue.remainingCapacity() == 0) {
             if (nalType == 7 || nalType == 8 || nalType == 5) {

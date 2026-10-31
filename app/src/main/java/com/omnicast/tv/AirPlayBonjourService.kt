@@ -207,8 +207,10 @@ class AirPlayBonjourService(
 
         executor.execute {
             try {
-                audioCtrlUdp7104 = DatagramSocket(7104).apply { reuseAddress = true }
+                val ctrl = DatagramSocket(7104).apply { reuseAddress = true }
+                audioCtrlUdp7104 = ctrl
                 audioDataUdp7103 = DatagramSocket(7103).apply { reuseAddress = true }
+                executor.execute { try { receiveSyncLoop(ctrl) } catch (_: Throwable) {} }
                 receiveAudioLoop(audioDataUdp7103!!)
             } catch (_: Throwable) {}
         }
@@ -441,6 +443,7 @@ class AirPlayBonjourService(
                                                 96 -> {
                                                     val ct = (streamDict["ct"] as? NSNumber)?.intValue() ?: 8
                                                     initAudioCipher()
+                                                    AvSync.resetAudio()
                                                     val audioErr = audioDecoder.start(ct)
                                                     val aStream = NSDictionary()
                                                     aStream["type"] = NSNumber(96)
@@ -580,6 +583,24 @@ class AirPlayBonjourService(
         audioIv = IvParameterSpec(iv)
     }
 
+    // Paquetes de sincronía (PT 0x54) que liga el timestamp RTP del audio con la hora NTP de la Mac; los usa AvSync
+    private fun receiveSyncLoop(socket: DatagramSocket) {
+        val buf = ByteArray(128)
+        val pkt = DatagramPacket(buf, buf.size)
+        var logged = 0
+        while (isRunning) {
+            pkt.length = buf.size
+            socket.receive(pkt)
+            if (pkt.length < 20 || (buf[1].toInt() and 0x7F) != 0x54) continue
+            val bb = ByteBuffer.wrap(buf)
+            val rtpA = bb.getInt(4).toLong() and 0xFFFFFFFFL
+            val rtpB = bb.getInt(16).toLong() and 0xFFFFFFFFL
+            // ponytail: se liga la hora NTP al timestamp de los bytes 4-7; si Δ≠0 y el audio sale desfasado, probar rtpB
+            AvSync.onSync(rtpA, AvSync.ntpMs(bb.getLong(8)))
+            if (logged++ < 3) logTv("Sync de audio recibido (rtp[4]=$rtpA rtp[16]=$rtpB Δ=${rtpB - rtpA})")
+        }
+    }
+
     private fun receiveAudioLoop(socket: DatagramSocket) {
         // Con el decodificador de video compitiendo por CPU, un hilo de prioridad normal pierde paquetes y deja sin datos al AudioTrack
         android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_URGENT_AUDIO)
@@ -609,6 +630,7 @@ class AirPlayBonjourService(
                     logTv("Primer paquete de audio recibido (${payloadLen}B)")
                 }
                 val seq = ((buf[2].toInt() and 0xFF) shl 8) or (buf[3].toInt() and 0xFF)
+                AvSync.onAudio(ByteBuffer.wrap(buf).getInt(4).toLong() and 0xFFFFFFFFL, android.os.SystemClock.elapsedRealtime())
                 audioDecoder.decode(buf, 12, payloadLen, seq)
             } catch (e: Throwable) {
                 if (!logged) {
@@ -679,7 +701,12 @@ class AirPlayBonjourService(
                         }
                     }
                     0 -> {
-                        val encHead = if (frameCounter == 0) payload.copyOf(minOf(8, payload.size)) else null
+                        // Bytes 8-15 (little-endian): hora NTP de captura del cuadro
+                        AvSync.onVideo(
+                            AvSync.ntpMs(ByteBuffer.wrap(header, 8, 8).order(ByteOrder.LITTLE_ENDIAN).long),
+                            android.os.SystemClock.elapsedRealtime()
+                        )
+                        val encHead =if (frameCounter == 0) payload.copyOf(minOf(8, payload.size)) else null
                         decryptVideoPacket(payload)
                         var offset = 0
                         var validNals = 0

@@ -2,6 +2,7 @@ package com.omnicast.tv
 
 import android.media.AudioAttributes
 import android.media.AudioFormat
+import android.media.AudioTimestamp
 import android.media.AudioTrack
 import android.util.Log
 
@@ -20,6 +21,9 @@ class LowLatencyAudioPlayer {
     private var rearms = 0
     private var drops = 0
     private var lastStatsMs = 0L
+    private var lastLatMs = 0L
+    private var rate = 44100
+    private var writtenFrames = 0L
 
     fun start(sampleRate: Int = 48000) {
         stop()
@@ -47,6 +51,8 @@ class LowLatencyAudioPlayer {
                 .setBufferSizeInBytes(bufBytes)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+            rate = sampleRate
+            writtenFrames = 0
             prerollFrames = sampleRate * PREROLL_MS / 1000
             bufferedFrames = 0
             playing = false
@@ -66,6 +72,7 @@ class LowLatencyAudioPlayer {
             val n = t.write(pcmBytes, offset, length, AudioTrack.WRITE_NON_BLOCKING)
             if (n < length) drops++ // buffer lleno: descartar mantiene acotada la latencia
             if (n <= 0) return
+            writtenFrames += n / 4
             if (!playing) {
                 bufferedFrames += n / 4
                 if (bufferedFrames >= prerollFrames) {
@@ -81,11 +88,26 @@ class LowLatencyAudioPlayer {
                 rearms++
             }
             val now = System.currentTimeMillis()
+            if (playing && now - lastLatMs >= 200) {
+                lastLatMs = now
+                publishOutputLatency(t)
+            }
             if (now - lastStatsMs >= 5000) {
                 lastStatsMs = now
                 Log.i("LowLatencyAudio", "rearms=$rearms drops=$drops underrunsTrack=${t.underrunCount}")
             }
         } catch (_: Exception) {}
+    }
+
+    /** Cuánto falta para que suene lo último escrito (colchón + mezclador + salida de la TV); AvSync lo usa para alinear el video. */
+    private fun publishOutputLatency(t: AudioTrack) {
+        val ts = AudioTimestamp()
+        val ms = if (t.getTimestamp(ts)) {
+            (ts.nanoTime + (writtenFrames - ts.framePosition) * 1_000_000_000L / rate - System.nanoTime()) / 1_000_000
+        } else {
+            (writtenFrames - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)) * 1000L / rate
+        }
+        AvSync.audioOutMs = ms.coerceIn(0, 1500)
     }
 
     fun stop() {

@@ -60,6 +60,7 @@ class MainActivity : AppCompatActivity() {
     private var airPlayService: AirPlayBonjourService? = null
     private var streamServer: NativeStreamServer? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
     private var pulseAnimator: ObjectAnimator? = null
 
     @Volatile private var surfaceReady = false
@@ -91,6 +92,13 @@ class MainActivity : AppCompatActivity() {
             setReferenceCounted(true)
             acquire()
         }
+        // Sin este lock el Wi-Fi de la TV entra en ahorro de energía: el ping en reposo varía de 4 a 69 ms y el
+        // audio/video llegan a ráfagas (microcortes). El modo de baja latencia existe desde Android 10.
+        wifiLock = wifiManager?.createWifiLock(
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+            else WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+            "OmniCastWifi"
+        )?.apply { setReferenceCounted(false); acquire() }
 
         val localIp = getLocalIpAddress()
 
@@ -604,6 +612,9 @@ class MainActivity : AppCompatActivity() {
         dlnaService?.stop()
         if (multicastLock?.isHeld == true) {
             multicastLock?.release()
+        }
+        if (wifiLock?.isHeld == true) {
+            wifiLock?.release()
         }
         super.onDestroy()
     }
