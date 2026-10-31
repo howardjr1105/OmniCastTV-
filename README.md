@@ -137,6 +137,8 @@ adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 |---|---|---|---|
 | `PREROLL_MS` | `LowLatencyAudioPlayer.kt` | 50 | Audio acumulado antes de empezar a sonar. Súbelo si hay cortes en Wi-Fi malo; bájalo para menos retardo. |
 | `BUFFER_MS` | `LowLatencyAudioPlayer.kt` | 300 | Tamaño del buffer del `AudioTrack`. |
+| `HIGH_MS` / `LOW_MS` | `LowLatencyAudioPlayer.kt` | 200 / 60 | Cola de audio que dispara el recorte y hasta dónde se recorta. |
+| `MIN_JITTER_MS` | `HardwareH264Decoder.kt` | 60 | Colchón mínimo de video contra el jitter del Wi-Fi. |
 | `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video mientras `AvSync` aún no tiene datos de audio. |
 | `MAX_DELAY_MS` / `SLEW_MS` | `HardwareH264Decoder.kt` | 800 / 3 | Tope del retardo y ritmo con que se acerca al objetivo. |
 | Resolución y fps anunciados | `AirPlayBonjourService.kt` | 1920×1080 a 60 | Lo que la Mac cree que soporta la TV. |
@@ -179,6 +181,7 @@ Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con meno
 
 **Audio**
 - `AudioTrack` con buffer de **300 ms** y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz) y cualquier ráfaga de Wi-Fi producía chasquidos.
+- **Cola acotada:** la Mac manda una ráfaga de audio al empezar. Como el audio entra al mismo ritmo que sale, esa cola no se vaciaba nunca y el audio iba hasta 700 ms atrasado. Si la cola pasa de `HIGH_MS` (200 ms), se descarta lo que llega hasta bajar a `LOW_MS` (60 ms). Se nota como un corte breve, una sola vez.
 - **Colchón anti-jitter:** el audio empieza a sonar con `PREROLL_MS` acumulados. Si el buffer se vacía, se pausa y vuelve a llenar, en lugar de seguir a trompicones.
 - **Paquetes RTP:** AAC-ELD es un códec con estado, así que un paquete duplicado o tardío corrompe lo que sigue. Se descartan por número de secuencia.
 - **`WifiLock` en modo de baja latencia** mientras la app está abierta. Sin él, el Wi-Fi de la TV entra en ahorro de energía y el tráfico llega a ráfagas (en una TV de prueba, el ping en reposo variaba entre 4 y 69 ms), lo que se oye como microcortes.
@@ -186,6 +189,7 @@ Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con meno
 
 **Video**
 - Decodificación por hardware directa a la superficie, con cada cuadro mostrado en cuanto sale del decodificador.
+- **Cada cuadro se programa por su hora de captura** (que la Mac incluye en el paquete) más el tránsito mínimo medido y el retardo de sincronía, en vez de mostrarse al llegar. El jitter del Wi-Fi no llega a la pantalla y se evitan los saltos. Un cuadro que llega tarde sale de inmediato. Hay un colchón mínimo de `MIN_JITTER_MS` (60 ms).
 - **El retardo de sincronía se aplica antes de decodificar**, sobre datos comprimidos, que cuestan casi nada. Retener cuadros ya decodificados agota los pocos buffers de salida de algunos decodificadores OMX (como `OMX.MS.AVC.Decoder`) y la imagen se arrastra.
 - Los cuadros se descartan con cuidado: nunca el SPS/PPS ni los cuadros clave (IDR).
 - `KEY_MAX_INPUT_SIZE` de 2 MB por buffer de entrada, para no gastar memoria en TV con poca RAM.

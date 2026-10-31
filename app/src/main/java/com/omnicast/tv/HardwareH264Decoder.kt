@@ -18,7 +18,8 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
 
     private var codec: MediaCodec? = null
     @Volatile private var isRunning = false
-    private class Nal(val data: ByteArray, val atMs: Long)
+    /** atMs = llegada local; ntpMs = hora de captura en el emisor (0 si no la hay: SPS/PPS o emisor web). */
+    private class Nal(val data: ByteArray, val atMs: Long, val ntpMs: Long = 0)
     private val nalQueue = LinkedBlockingDeque<Nal>(180)
     @Volatile private var framesIn = 0
     @Volatile private var framesOut = 0
@@ -60,6 +61,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 var pts = 0L
                 var trimMs = 0L
                 var lastReadMs = 0L
+                var offMs = Long.MIN_VALUE // instante local de salida − hora de captura, ya suavizado
                 appliedMs = 0
                 while (isRunning) {
                     try {
@@ -72,11 +74,23 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                             lastReadMs = now
                             trimMs = readTrimMs() ?: trimMs
                         }
-                        // Objetivo medido por AvSync (o el valor por defecto si aún no hay datos) + ajuste manual.
-                        // Se acerca de a SLEW_MS por cuadro para que el video se acelere o frene sin saltos.
-                        val target = ((AvSync.targetDelayMs() ?: DEFAULT_VIDEO_DELAY_MS) + trimMs).coerceIn(0, MAX_DELAY_MS)
-                        appliedMs += (target - appliedMs).coerceIn(-SLEW_MS, SLEW_MS)
-                        val wait = item.atMs + appliedMs - now
+                        // Retardo extra medido por AvSync (o el valor por defecto si aún no hay datos) + ajuste manual.
+                        val extra = (AvSync.targetDelayMs() ?: DEFAULT_VIDEO_DELAY_MS) + trimMs
+                        val release: Long
+                        if (item.ntpMs > 0) {
+                            // Cada cuadro sale a (hora de captura + tránsito mínimo + extra): el jitter del Wi-Fi no llega a la
+                            // pantalla y el video se ve fluido. Un cuadro tardío sale de inmediato (wait ≤ 0).
+                            val targetOff = (AvSync.videoBaseMs() ?: (item.atMs - item.ntpMs)) + extra.coerceIn(MIN_JITTER_MS, MAX_DELAY_MS)
+                            offMs = if (offMs == Long.MIN_VALUE) (item.atMs - item.ntpMs) + extra.coerceIn(MIN_JITTER_MS, MAX_DELAY_MS)
+                                    else offMs + (targetOff - offMs).coerceIn(-SLEW_MS, SLEW_MS)
+                            release = item.ntpMs + offMs
+                            appliedMs = release - item.atMs
+                        } else {
+                            // Sin hora de captura (emisor web): retardo fijo desde la llegada
+                            appliedMs += (extra.coerceIn(0, MAX_DELAY_MS) - appliedMs).coerceIn(-SLEW_MS, SLEW_MS)
+                            release = item.atMs + appliedMs
+                        }
+                        val wait = (release - now).coerceAtMost(MAX_DELAY_MS + 200)
                         if (item.atMs > 0 && wait > 0) Thread.sleep(wait)
                         // Nunca descartar un cuadro: perder un P-frame corrompe la imagen hasta el siguiente IDR
                         var inIdx = -1
@@ -158,6 +172,7 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
         const val DELAY_FILE = "/sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
         const val DEFAULT_VIDEO_DELAY_MS = 50L // solo mientras AvSync no tiene datos (p. ej. antes de que empiece el audio)
         const val MAX_DELAY_MS = 800L
+        const val MIN_JITTER_MS = 60L // colchón mínimo para absorber el jitter del Wi-Fi (ping en reposo hasta ~66 ms)
         const val SLEW_MS = 3L
     }
 
@@ -179,7 +194,9 @@ class HardwareH264Decoder(private val surface: Surface, private val onError: (St
                 return
             }
         }
-        nalQueue.offerLast(Nal(nalData, SystemClock.elapsedRealtime()))
+        // onVideo() (hilo de red, justo antes de esta llamada) dejó la hora de captura de este cuadro; SPS/PPS no la llevan
+        val ntp = if (nalType == 7 || nalType == 8) 0L else AvSync.lastVideoNtpMs
+        nalQueue.offerLast(Nal(nalData, SystemClock.elapsedRealtime(), ntp))
     }
 
     private fun findFirstNalType(data: ByteArray): Int {

@@ -24,6 +24,7 @@ class LowLatencyAudioPlayer {
     private var lastLatMs = 0L
     private var rate = 44100
     private var writtenFrames = 0L
+    private var trimming = false
 
     fun start(sampleRate: Int = 48000) {
         stop()
@@ -32,7 +33,8 @@ class LowLatencyAudioPlayer {
             val encoding = AudioFormat.ENCODING_PCM_16BIT
             val minBufSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
             // Buffer mínimo + modo LOW_LATENCY = underruns con 44.1 kHz (el mezclador de la TV va a 48 kHz y no da pista rápida).
-            val bufBytes = maxOf(minBufSize * 4, sampleRate * 4 * BUFFER_MS / 1000)
+            // En esta TV el mínimo ya son 144 ms: ×4 daba un buffer de 578 ms que se llenaba con la ráfaga del inicio y retrasaba el audio 700 ms
+            val bufBytes = maxOf(minBufSize, sampleRate * 4 * BUFFER_MS / 1000)
 
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -53,6 +55,7 @@ class LowLatencyAudioPlayer {
                 .build()
             rate = sampleRate
             writtenFrames = 0
+            trimming = false
             prerollFrames = sampleRate * PREROLL_MS / 1000
             bufferedFrames = 0
             playing = false
@@ -69,6 +72,14 @@ class LowLatencyAudioPlayer {
         val t = audioTrack ?: return
         if (!isRunning) return
         try {
+            if (playing) {
+                // Cola de audio por reproducir. Si una ráfaga la deja por encima de HIGH_MS, se descarta lo que llega hasta
+                // bajar a LOW_MS: si no, esa cola se queda para siempre (entra al mismo ritmo que sale) y el audio va atrasado.
+                val queued = writtenFrames - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
+                if (trimming) { if (queued <= rate * LOW_MS / 1000) trimming = false }
+                else if (queued > rate * HIGH_MS / 1000) trimming = true
+                if (trimming) { drops++; return }
+            }
             val n = t.write(pcmBytes, offset, length, AudioTrack.WRITE_NON_BLOCKING)
             if (n < length) drops++ // buffer lleno: descartar mantiene acotada la latencia
             if (n <= 0) return
@@ -122,6 +133,8 @@ class LowLatencyAudioPlayer {
 
     private companion object {
         const val BUFFER_MS = 300
+        const val HIGH_MS = 200 // cola máxima tolerada antes de recortar
+        const val LOW_MS = 60   // hasta dónde se recorta
         const val PREROLL_MS = 50// ponytail: fijo; subir si sigue cortándose en Wi-Fi malo, o hacerlo adaptativo
     }
 }
