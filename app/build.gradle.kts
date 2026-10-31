@@ -171,8 +171,6 @@ dependencies {
     implementation("androidx.media3:media3-exoplayer:1.2.1")
     implementation("androidx.media3:media3-exoplayer-hls:1.2.1")
     implementation("androidx.media3:media3-ui:1.2.1")
-    // JmDNS para anunciar servicios nativos _airplay._tcp.local. y _raop._tcp.local.
-    implementation("org.jmdns:jmdns:3.5.9")
     // QR en la pantalla de inicio para abrir el emisor web desde un teléfono
     implementation("com.google.zxing:core:3.5.3")
     // Criptografía AirPlay 2 Nativa (Ed25519, Curve25519 ECDH, Apple Binary Plist y SLF4J)

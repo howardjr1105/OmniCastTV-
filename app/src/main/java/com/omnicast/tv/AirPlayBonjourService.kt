@@ -1,6 +1,8 @@
 package com.omnicast.tv
 
 import android.content.Context
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import android.util.Log
 import com.dd.plist.BinaryPropertyListWriter
 import com.dd.plist.NSArray
@@ -36,8 +38,6 @@ import java.util.concurrent.Executors
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
-import javax.jmdns.JmDNS
-import javax.jmdns.ServiceInfo
 
 class AirPlayBonjourService(
     private val context: Context,
@@ -52,7 +52,8 @@ class AirPlayBonjourService(
 ) {
     private val executor = Executors.newCachedThreadPool()
     @Volatile private var isRunning = false
-    private var jmdns: JmDNS? = null
+    // mDNS vía NsdManager (mdnsd del sistema): JmDNS abría su propio socket 5353 y en algunas TV sus anuncios nunca salían.
+    private val nsdListeners = mutableListOf<NsdManager.RegistrationListener>()
 
     private var airplaySocket7000: ServerSocket? = null
     private var raopSocket5000: ServerSocket? = null
@@ -108,8 +109,23 @@ class AirPlayBonjourService(
 
         executor.execute {
             try {
-                val addr = InetAddress.getByName(localIp)
-                jmdns = JmDNS.create(addr, "OmniCastTV")
+                val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+                fun register(type: String, name: String, port: Int, props: Map<String, String>) {
+                    val info = NsdServiceInfo().apply {
+                        serviceType = type
+                        serviceName = name
+                        setPort(port)
+                        props.forEach { (k, v) -> setAttribute(k, v) }
+                    }
+                    val l = object : NsdManager.RegistrationListener {
+                        override fun onServiceRegistered(i: NsdServiceInfo) = logTv("mDNS registrado: $type como '${i.serviceName}'")
+                        override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) = logTv("Error mDNS $type: código $code")
+                        override fun onServiceUnregistered(i: NsdServiceInfo) {}
+                        override fun onUnregistrationFailed(i: NsdServiceInfo, code: Int) {}
+                    }
+                    synchronized(nsdListeners) { nsdListeners += l }
+                    nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, l)
+                }
 
                 val airplayProps = mapOf(
                     "deviceid" to macAddress,
@@ -121,9 +137,7 @@ class AirPlayBonjourService(
                     "srcvers" to "220.68",
                     "vv" to "2"
                 )
-                jmdns?.registerService(
-                    ServiceInfo.create("_airplay._tcp.local.", deviceName, 7000, 0, 0, airplayProps)
-                )
+                register("_airplay._tcp", deviceName, 7000, airplayProps)
 
                 val raopProps = mapOf(
                     "ch" to "2",
@@ -146,10 +160,8 @@ class AirPlayBonjourService(
                     "vn" to "65537",
                     "pk" to edPublicKeyHex
                 )
-                jmdns?.registerService(
-                    ServiceInfo.create("_raop._tcp.local.", "${macCompact}@${deviceName}", 5000, 0, 0, raopProps)
-                )
-                logTv("Bonjour activo en $localIp (:7000 AirPlay / :5000 RAOP)")
+                register("_raop._tcp", "${macCompact}@${deviceName}", 5000, raopProps)
+                logTv("Bonjour (NsdManager) solicitado en $localIp (:7000 AirPlay / :5000 RAOP)")
             } catch (e: Throwable) {
                 logTv("Error mDNS: ${e.message}")
             }
@@ -850,8 +862,8 @@ class AirPlayBonjourService(
         try { audioCtrlUdp7104?.close() } catch (_: Throwable) {}
         audioDecoder.stop()
         try {
-            jmdns?.unregisterAllServices()
-            jmdns?.close()
+            val nsd = context.getSystemService(Context.NSD_SERVICE) as NsdManager
+            synchronized(nsdListeners) { nsdListeners.forEach { try { nsd.unregisterService(it) } catch (_: Throwable) {} }; nsdListeners.clear() }
         } catch (_: Throwable) {}
     }
 }
