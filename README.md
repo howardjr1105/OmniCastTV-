@@ -136,7 +136,8 @@ adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 | Constante | Archivo | Valor | Para qué |
 |---|---|---|---|
 | `PREROLL_MS` | `LowLatencyAudioPlayer.kt` | 50 | Audio acumulado antes de empezar a sonar. Súbelo si hay cortes en Wi-Fi malo; bájalo para menos retardo. |
-| `BUFFER_MS` | `LowLatencyAudioPlayer.kt` | 300 | Tamaño del buffer del `AudioTrack`. |
+| Buffer del `AudioTrack` | `LowLatencyAudioPlayer.kt` | mínimo × 4 | **No reducirlo**: con 300 ms Android lo asignó a la salida «deep buffer» (`Flags 0x008` en `dumpsys media.audio_flinger`), que en una TV de prueba nunca consumía y dejaba el audio mudo. La latencia la acota el recorte de cola, no el tamaño del buffer. |
+| `STALL_MS` | `LowLatencyAudioPlayer.kt` | 1000 | Si la pista no avanza durante este tiempo con audio en cola, se reconstruye. |
 | `HIGH_MS` / `LOW_MS` | `LowLatencyAudioPlayer.kt` | 200 / 60 | Cola de audio que dispara el recorte y hasta dónde se recorta. |
 | `MIN_JITTER_MS` | `HardwareH264Decoder.kt` | 60 | Colchón mínimo de video contra el jitter del Wi-Fi. |
 | `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video mientras `AvSync` aún no tiene datos de audio. |
@@ -180,7 +181,7 @@ El **emisor web** (`sender.html`) captura la pantalla con `getDisplayMedia`, cod
 Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con menos de 1 GB de RAM). Por eso estas decisiones:
 
 **Audio**
-- `AudioTrack` con buffer de **300 ms** y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz) y cualquier ráfaga de Wi-Fi producía chasquidos.
+- `AudioTrack` con el buffer del sistema (mínimo × 4) y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz) y cualquier ráfaga de Wi-Fi producía chasquidos.
 - **Cola acotada:** la Mac manda una ráfaga de audio al empezar. Como el audio entra al mismo ritmo que sale, esa cola no se vaciaba nunca y el audio iba hasta 700 ms atrasado. Si la cola pasa de `HIGH_MS` (200 ms), se descarta lo que llega hasta bajar a `LOW_MS` (60 ms). Se nota como un corte breve, una sola vez.
 - **Colchón anti-jitter:** el audio empieza a sonar con `PREROLL_MS` acumulados. Si el buffer se vacía, se pausa y vuelve a llenar, en lugar de seguir a trompicones.
 - **Paquetes RTP:** AAC-ELD es un códec con estado, así que un paquete duplicado o tardío corrompe lo que sigue. Se descartan por número de secuencia.

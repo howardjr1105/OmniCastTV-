@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTimestamp
 import android.media.AudioTrack
+import android.os.SystemClock
 import android.util.Log
 
 /**
@@ -25,6 +26,8 @@ class LowLatencyAudioPlayer {
     private var rate = 44100
     private var writtenFrames = 0L
     private var trimming = false
+    private var lastHead = 0L
+    private var lastHeadMs = 0L
 
     fun start(sampleRate: Int = 48000) {
         stop()
@@ -33,8 +36,9 @@ class LowLatencyAudioPlayer {
             val encoding = AudioFormat.ENCODING_PCM_16BIT
             val minBufSize = AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding)
             // Buffer mínimo + modo LOW_LATENCY = underruns con 44.1 kHz (el mezclador de la TV va a 48 kHz y no da pista rápida).
-            // En esta TV el mínimo ya son 144 ms: ×4 daba un buffer de 578 ms que se llenaba con la ráfaga del inicio y retrasaba el audio 700 ms
-            val bufBytes = maxOf(minBufSize, sampleRate * 4 * BUFFER_MS / 1000)
+            // NO bajar de ~mínimo×4: con 300 ms Android asignó esta pista a la salida "deep buffer" (Flags 0x008), que en esta TV
+            // nunca consume y deja el audio mudo. La latencia no depende del tamaño del buffer: la acota el recorte de cola.
+            val bufBytes = minBufSize * 4
 
             audioTrack = AudioTrack.Builder()
                 .setAudioAttributes(
@@ -75,7 +79,16 @@ class LowLatencyAudioPlayer {
             if (playing) {
                 // Cola de audio por reproducir. Si una ráfaga la deja por encima de HIGH_MS, se descarta lo que llega hasta
                 // bajar a LOW_MS: si no, esa cola se queda para siempre (entra al mismo ritmo que sale) y el audio va atrasado.
-                val queued = writtenFrames - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)
+                val head = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                val nowMs = SystemClock.elapsedRealtime()
+                if (head != lastHead) { lastHead = head; lastHeadMs = nowMs }
+                else if (writtenFrames > head && nowMs - lastHeadMs > STALL_MS) {
+                    // Hay audio en cola pero la pista no avanza: salida colgada. Reconstruir en vez de quedarse mudo.
+                    Log.w("LowLatencyAudio", "Pista detenida (head=$head, cola=${writtenFrames - head}): reiniciando")
+                    start(rate)
+                    return
+                }
+                val queued = writtenFrames - head
                 if (trimming) { if (queued <= rate * LOW_MS / 1000) trimming = false }
                 else if (queued > rate * HIGH_MS / 1000) trimming = true
                 if (trimming) { drops++; return }
@@ -90,6 +103,8 @@ class LowLatencyAudioPlayer {
                     t.play()
                     playing = true
                     lastUnderruns = t.underrunCount
+                    lastHead = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+                    lastHeadMs = SystemClock.elapsedRealtime()
                 }
             } else if (t.underrunCount != lastUnderruns) {
                 // Se vació: pausar y volver a llenar el colchón antes de seguir
@@ -132,7 +147,7 @@ class LowLatencyAudioPlayer {
     }
 
     private companion object {
-        const val BUFFER_MS = 300
+        const val STALL_MS = 1000L // sin avanzar este tiempo con audio en cola = pista colgada
         const val HIGH_MS = 200 // cola máxima tolerada antes de recortar
         const val LOW_MS = 60   // hasta dónde se recorta
         const val PREROLL_MS = 50// ponytail: fijo; subir si sigue cortándose en Wi-Fi malo, o hacerlo adaptativo
