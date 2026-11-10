@@ -135,7 +135,7 @@ adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 
 | Constante | Archivo | Valor | Para qué |
 |---|---|---|---|
-| Buffer del `AudioTrack` | `LowLatencyAudioPlayer.kt` | mínimo × 4 | **No fijarlo en ms**: con 300 ms una TV asignó la pista a la salida «deep buffer» (`Flags 0x008` en `dumpsys media.audio_flinger`), que nunca consumía y dejaba el audio mudo. El colchón objetivo es 1 × mínimo (hasta 2 ×) y se recorta al pasar de 3 ×. |
+| Buffer del `AudioTrack` | `LowLatencyAudioPlayer.kt` | mínimo × 4, modo `LOW_LATENCY` | **Sin `LOW_LATENCY`, un buffer grande manda la pista a la salida «deep buffer»** (`Flags 0x008` en `dumpsys media.audio_flinger`), que en el Chromecast HD y en una TCL nunca consumía y dejaba el audio mudo. Si aun así la pista no avanza 1,5 s, se reconstruye con la mitad de buffer. El colchón objetivo es 1 × mínimo (hasta 2 ×) y se recorta al pasar de 3 ×. |
 | `STEP_UP_MS` / `STEP_DOWN_MS` / `CALM_MS` | `LowLatencyAudioPlayer.kt` | 30 / 10 / 60000 | El colchón crece 30 ms tras cada underrun y devuelve 10 ms por cada minuto sin ellos. |
 | `AudioPacing.MAX_PPM` | `LowLatencyAudioPlayer.kt` | 5000 | Corrección máxima de velocidad del audio (±0,5 %). |
 | `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video mientras `AvSync` aún no tiene datos de audio. |
@@ -179,7 +179,7 @@ El **emisor web** (`sender.html`) captura la pantalla con `getDisplayMedia`, cod
 Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con menos de 1 GB de RAM). Por eso estas decisiones:
 
 **Audio**
-- `AudioTrack` con el buffer mínimo del sistema × 4 y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz): en un Chromecast HD el mezclador consume en bloques de 43 ms, el buffer de 85 ms se llenaba y vaciaba sin parar y el sonido salía robótico y con cortes.
+- `AudioTrack` con el buffer mínimo del sistema × 4 y modo `LOW_LATENCY` (que evita la salida «deep buffer», muda en estas TV). Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz): en un Chromecast HD el mezclador consume en bloques de 43 ms, el buffer de 85 ms se llenaba y vaciaba sin parar y el sonido salía robótico y con cortes.
 - **Colchón con control de nivel:** la app mantiene una cola de audio objetivo igual al buffer mínimo de cada TV (unos 2 bloques de su mezclador). Arranca rellenando con silencio hasta ese nivel. Una vez por segundo ajusta la velocidad de reproducción hasta ±0,5 % (inaudible) para volver al objetivo, lo que también absorbe la diferencia de reloj con la Mac.
 - **Underruns:** si la cola se vacía, se repone con silencio sin pausar la pista y el objetivo sube 30 ms (hasta el doble del mínimo). Tras un minuto sin cortes vuelve a bajar poco a poco.
 - **Cola acotada:** la Mac manda una ráfaga de audio al empezar. Si la cola pasa de 3 × el mínimo, se descarta lo que llega hasta volver al objetivo; si no, el audio quedaría atrasado para siempre. Se nota como un corte breve, una sola vez.

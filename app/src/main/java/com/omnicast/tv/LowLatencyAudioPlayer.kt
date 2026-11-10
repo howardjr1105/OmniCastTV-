@@ -4,6 +4,7 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTimestamp
 import android.media.AudioTrack
+import android.os.Build
 import android.os.SystemClock
 import android.util.Log
 
@@ -51,6 +52,9 @@ class LowLatencyAudioPlayer {
     private var fills = 0
     private var drops = 0
     private var silence = ByteArray(0)
+    private var bufMult = 4 // múltiplo del buffer mínimo; baja si la pista se cuelga (no se reinicia entre start())
+    private var lastHead = 0L
+    private var lastHeadMs = 0L
 
     fun start(sampleRate: Int = 48000) {
         stop()
@@ -58,9 +62,10 @@ class LowLatencyAudioPlayer {
             val channelConfig = AudioFormat.CHANNEL_OUT_STEREO
             val encoding = AudioFormat.ENCODING_PCM_16BIT
             val minBufSize = maxOf(AudioTrack.getMinBufferSize(sampleRate, channelConfig, encoding), sampleRate * 4 / 25)
-            // Mínimo × 4 y modo estándar. NO fijar un tamaño en ms: con 300 ms una TV asignó la pista a la salida
-            // "deep buffer" (Flags 0x008 en dumpsys media.audio_flinger), que nunca consumía y dejaba el audio mudo.
-            val t = AudioTrack.Builder()
+            // Un buffer grande con modo estándar manda la pista a la salida "deep buffer" (Flags 0x008 en
+            // dumpsys media.audio_flinger), que en estas TV nunca consume y deja el audio mudo. LOW_LATENCY la excluye;
+            // los cortes los evita el colchón controlado de abajo, no el tamaño del buffer.
+            val builder = AudioTrack.Builder()
                 .setAudioAttributes(
                     AudioAttributes.Builder()
                         .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -74,16 +79,19 @@ class LowLatencyAudioPlayer {
                         .setChannelMask(channelConfig)
                         .build()
                 )
-                .setBufferSizeInBytes(minBufSize * 4)
+                .setBufferSizeInBytes(minBufSize * bufMult)
                 .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) builder.setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+            val t = builder.build()
             audioTrack = t
             rate = sampleRate
             curRate = sampleRate
             writtenFrames = 0
             started = false
-            minFrames = t.bufferSizeInFrames / 4
+            minFrames = minBufSize / 4
             targetFrames = minFrames
+            lastHead = 0
+            lastHeadMs = SystemClock.elapsedRealtime()
             trimming = false
             trough = Int.MAX_VALUE
             lastTrough = 0
@@ -103,7 +111,18 @@ class LowLatencyAudioPlayer {
         try {
             val now = SystemClock.elapsedRealtime()
             // ponytail: playbackHeadPosition da la vuelta a los 2^32 frames (~27 h seguidas a 44,1 kHz); reiniciar la pista si importa
-            val queued = (writtenFrames - (t.playbackHeadPosition.toLong() and 0xFFFFFFFFL)).toInt()
+            val head = t.playbackHeadPosition.toLong() and 0xFFFFFFFFL
+            val queued = (writtenFrames - head).toInt()
+            if (started) {
+                if (head != lastHead) { lastHead = head; lastHeadMs = now }
+                else if (queued > 0 && now - lastHeadMs > STALL_MS && bufMult > 1) {
+                    // Hay audio en cola pero la pista no avanza (salida colgada): reconstruir con un buffer menor en vez de quedar mudo
+                    bufMult /= 2
+                    Log.w("LowLatencyAudio", "Pista detenida (head=$head, cola=$queued): reiniciando con buffer x$bufMult")
+                    start(rate)
+                    return
+                }
+            }
             if (!started) {
                 fill(t, targetFrames)
                 t.play()
@@ -188,5 +207,6 @@ class LowLatencyAudioPlayer {
         const val STEP_UP_MS = 30      // margen extra del colchón tras cada underrun (tope: 2 × buffer mínimo)
         const val STEP_DOWN_MS = 10    // lo que se devuelve tras CALM_MS sin underruns
         const val CALM_MS = 60_000L
+        const val STALL_MS = 1500L     // sin avanzar este tiempo con audio en cola = pista colgada
     }
 }
