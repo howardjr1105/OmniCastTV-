@@ -54,6 +54,7 @@ class AirPlayBonjourService(
     @Volatile private var isRunning = false
     // mDNS vía NsdManager (mdnsd del sistema): JmDNS abría su propio socket 5353 y en algunas TV sus anuncios nunca salían.
     private val nsdListeners = mutableListOf<NsdManager.RegistrationListener>()
+    private val registeredTypes = java.util.concurrent.CopyOnWriteArraySet<String>()
 
     private var airplaySocket7000: ServerSocket? = null
     private var raopSocket5000: ServerSocket? = null
@@ -124,7 +125,10 @@ class AirPlayBonjourService(
                         props.forEach { (k, v) -> setAttribute(k, v) }
                     }
                     val l = object : NsdManager.RegistrationListener {
-                        override fun onServiceRegistered(i: NsdServiceInfo) = logTv("mDNS registrado: $type como '${i.serviceName}'")
+                        override fun onServiceRegistered(i: NsdServiceInfo) {
+                            registeredTypes += type
+                            logTv("mDNS registrado: $type como '${i.serviceName}'")
+                        }
                         override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) = logTv("Error mDNS $type: código $code")
                         override fun onServiceUnregistered(i: NsdServiceInfo) {}
                         override fun onUnregistrationFailed(i: NsdServiceInfo, code: Int) {}
@@ -143,7 +147,9 @@ class AirPlayBonjourService(
                     "srcvers" to "220.68",
                     "vv" to "2"
                 )
-                register("_airplay._tcp", deviceName, 7000, airplayProps)
+                // El nombre a secas lo rechaza el mDNS del sistema (NameConflictException en logcat, sin avisar a la app)
+                // porque ya lo usa otro servicio de la TV; con el sufijo el registro sí se completa. La Mac muestra este nombre.
+                register("_airplay._tcp", "$deviceName (OmniCast)", 7000, airplayProps)
 
                 val raopProps = mapOf(
                     "ch" to "2",
@@ -168,6 +174,11 @@ class AirPlayBonjourService(
                 )
                 register("_raop._tcp", "${macCompact}@${deviceName}", 5000, raopProps)
                 logTv("Bonjour (NsdManager) solicitado en $localIp (:7000 AirPlay / :5000 RAOP)")
+                // Android no avisa si el sistema descarta un registro (p. ej. conflicto de nombre): comprobarlo
+                Thread.sleep(6000)
+                listOf("_airplay._tcp", "_raop._tcp").filter { it !in registeredTypes }.forEach {
+                    logTv("AVISO: mDNS no confirmó $it; la TV no aparecerá en Duplicar pantalla (ver NameConflictException en logcat)")
+                }
             } catch (e: Throwable) {
                 logTv("Error mDNS: ${e.message}")
             }
