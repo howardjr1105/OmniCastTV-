@@ -3,6 +3,7 @@ package com.omnicast.tv
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
+import android.os.SystemClock
 import android.util.Log
 import java.nio.ByteBuffer
 
@@ -16,7 +17,16 @@ class AirPlayAudioDecoder {
     private val info = MediaCodec.BufferInfo()
     private var pts = 0L
     private var lastSeq = -1
+    private var lateRun = 0
     private var pcm = ByteArray(8192)
+    // Estadísticas de red de los últimos 5 s (logcat -s AirPlayAudio)
+    private var pkts = 0
+    private var lost = 0
+    private var late = 0
+    private var noBuf = 0
+    private var maxGapMs = 0L
+    private var lastArrivalMs = 0L
+    private var lastStatsMs = 0L
 
     /** @return null si arrancó bien, o el motivo del fallo para el log. */
     @Synchronized
@@ -44,6 +54,9 @@ class AirPlayAudioDecoder {
             player = LowLatencyAudioPlayer().also { it.start(44100) }
             pts = 0L
             lastSeq = -1
+            lateRun = 0
+            lastArrivalMs = 0L
+            lastStatsMs = 0L
             null
         } catch (e: Throwable) {
             Log.e("AirPlayAudio", "Error iniciando decoder AAC: ${e.message}")
@@ -56,11 +69,24 @@ class AirPlayAudioDecoder {
     @Synchronized
     fun decode(au: ByteArray, offset: Int, len: Int, seq: Int) {
         val c = codec ?: return
-        if (lastSeq >= 0) {
-            val d = (seq - lastSeq) and 0xFFFF
-            if (d == 0 || d > 0x8000) return
+        val now = SystemClock.elapsedRealtime()
+        if (lastArrivalMs != 0L && now - lastArrivalMs > maxGapMs) maxGapMs = now - lastArrivalMs
+        lastArrivalMs = now
+        pkts++
+        if (now - lastStatsMs >= 5000) {
+            if (lastStatsMs != 0L) Log.i("AirPlayAudio", "5s: paquetes=$pkts perdidos=$lost tardios=$late sinBuffer=$noBuf huecoMax=${maxGapMs}ms")
+            lastStatsMs = now
+            pkts = 0; lost = 0; late = 0; noBuf = 0; maxGapMs = 0
         }
+        if (lastSeq >= 0) {
+            val gap = AudioPacing.lostBefore(seq, lastSeq)
+            // Tras RESYNC_AFTER descartes seguidos no son paquetes tardíos: la Mac reinició la numeración. Seguirla o quedaría mudo.
+            if (gap < 0 && ++lateRun < RESYNC_AFTER) { late++; return }
+            if (gap > 0) lost += gap
+        }
+        lateRun = 0
         lastSeq = seq
+        if (len <= 0) return // paquete "sin datos": solo cuenta para la secuencia
         try {
             val inIdx = c.dequeueInputBuffer(5000)
             if (inIdx >= 0) {
@@ -70,7 +96,7 @@ class AirPlayAudioDecoder {
                 buf.put(au, offset, n)
                 c.queueInputBuffer(inIdx, 0, n, pts, 0)
                 pts += 10_000L // 480 muestras @ 44.1 kHz ≈ 10.9 ms; el pts no afecta a la salida PCM
-            }
+            } else noBuf++
             while (true) {
                 val outIdx = c.dequeueOutputBuffer(info, 0)
                 if (outIdx < 0) break
@@ -95,5 +121,9 @@ class AirPlayAudioDecoder {
         codec = null
         player?.stop()
         player = null
+    }
+
+    private companion object {
+        const val RESYNC_AFTER = 50 // ≈0,5 s de paquetes "tardíos" seguidos
     }
 }

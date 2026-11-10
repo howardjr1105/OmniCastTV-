@@ -45,7 +45,7 @@ jobs:
           OMNICAST_KEYSTORE_PASSWORD: ${{ secrets.OMNICAST_KEYSTORE_PASSWORD }}
         run: |
           if [ -f "OmniCastTV/settings.gradle.kts" ]; then cd OmniCastTV; fi
-          gradle assembleRelease assembleDebug
+          gradle testDebugUnitTest assembleRelease assembleDebug
 
           # Copiar y renombrar los APK en la raíz del workspace para su publicación
           cp app/build/outputs/apk/release/app-release.apk "$GITHUB_WORKSPACE/OmniCastTV.apk"

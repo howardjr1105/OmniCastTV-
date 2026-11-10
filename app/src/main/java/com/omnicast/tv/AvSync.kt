@@ -45,7 +45,9 @@ object AvSync {
 
     @Synchronized fun onVideo(ntpMs: Long, nowMs: Long) = video.add(nowMs - ntpMs, nowMs)
 
-    @Synchronized fun onSync(rtp: Long, ntpMs: Long) { rtpRef = rtp; ntpRefMs = ntpMs; haveRef = true }
+    // Los paquetes de sincronía llevan la hora con época NTP (1900); la del video viene con época Unix (1970).
+    // Medido en una TV real: restando 2 208 988 800 s ambos tránsitos coinciden (diferencia ≈ 100 ms).
+    @Synchronized fun onSync(rtp: Long, ntpMs: Long) { rtpRef = rtp; ntpRefMs = ntpMs - 2_208_988_800_000L; haveRef = true }
 
     @Synchronized fun onAudio(rtp: Long, nowMs: Long) {
         if (!haveRef) return

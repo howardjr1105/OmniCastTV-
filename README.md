@@ -35,7 +35,7 @@ OmniCast TV convierte una TV con Android en un receptor de pantalla compatible c
 Novedades recientes:
 
 - **La TV se anuncia con su propio nombre.** En el menú de duplicar ya no aparece el nombre de la app, sino el nombre que la TV tiene en *Ajustes → Acerca de → Nombre del dispositivo*. Ver [Configuración](#nombre-de-la-tv-en-el-menú-de-duplicar).
-- **Audio más estable.** Colchón anti-jitter, buffer más grande, descarte de paquetes RTP duplicados o tardíos y hilo de audio con prioridad alta. Ver [Calidad de audio y video](#calidad-de-audio-y-video).
+- **Audio más estable.** Colchón con control de nivel que se adapta al mezclador de cada TV, descarte de paquetes RTP duplicados o tardíos y hilo de audio con prioridad alta. Ver [Calidad de audio y video](#calidad-de-audio-y-video).
 - **Ajuste de sincronía audio/video** calibrable sin recompilar.
 - **Estadísticas en el log** del audio y del video para diagnosticar problemas.
 - Descubrimiento AirPlay con `NsdManager` (nativo de Android) en lugar de JmDNS, y corrección de FairPlay para Android 11.
@@ -135,8 +135,9 @@ adb shell "echo 40 > /sdcard/Android/data/com.omnicast.tv/files/av_delay_ms"
 
 | Constante | Archivo | Valor | Para qué |
 |---|---|---|---|
-| `PREROLL_MS` | `LowLatencyAudioPlayer.kt` | 50 | Audio acumulado antes de empezar a sonar. Súbelo si hay cortes en Wi-Fi malo; bájalo para menos retardo. |
-| `BUFFER_MS` | `LowLatencyAudioPlayer.kt` | 300 | Tamaño del buffer del `AudioTrack`. |
+| Buffer del `AudioTrack` | `LowLatencyAudioPlayer.kt` | mínimo × 4 | **No fijarlo en ms**: con 300 ms una TV asignó la pista a la salida «deep buffer» (`Flags 0x008` en `dumpsys media.audio_flinger`), que nunca consumía y dejaba el audio mudo. El colchón objetivo es 1 × mínimo (hasta 2 ×) y se recorta al pasar de 3 ×. |
+| `STEP_UP_MS` / `STEP_DOWN_MS` / `CALM_MS` | `LowLatencyAudioPlayer.kt` | 30 / 10 / 60000 | El colchón crece 30 ms tras cada underrun y devuelve 10 ms por cada minuto sin ellos. |
+| `AudioPacing.MAX_PPM` | `LowLatencyAudioPlayer.kt` | 5000 | Corrección máxima de velocidad del audio (±0,5 %). |
 | `DEFAULT_VIDEO_DELAY_MS` | `HardwareH264Decoder.kt` | 50 | Retardo de video mientras `AvSync` aún no tiene datos de audio. |
 | `MAX_DELAY_MS` / `SLEW_MS` | `HardwareH264Decoder.kt` | 800 / 3 | Tope del retardo y ritmo con que se acerca al objetivo. |
 | Resolución y fps anunciados | `AirPlayBonjourService.kt` | 1920×1080 a 60 | Lo que la Mac cree que soporta la TV. |
@@ -160,7 +161,7 @@ Mac / iPhone ──AirPlay──►  Bonjour (NsdManager) anuncia  _airplay._tcp
           │                                  │
   MediaCodec H.264 (hardware)         MediaCodec AAC → PCM
           │                                  │
-      SurfaceView                  AudioTrack con colchón anti-jitter
+      SurfaceView                  AudioTrack con colchón de nivel controlado
 ```
 
 1. **Descubrimiento.** `AirPlayBonjourService` registra los servicios Bonjour con `NsdManager`. Los registros llevan la clave pública Ed25519, las capacidades y el nombre de la TV.
@@ -178,9 +179,11 @@ El **emisor web** (`sender.html`) captura la pantalla con `getDisplayMedia`, cod
 Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con menos de 1 GB de RAM). Por eso estas decisiones:
 
 **Audio**
-- `AudioTrack` con buffer de **300 ms** y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz) y cualquier ráfaga de Wi-Fi producía chasquidos.
-- **Colchón anti-jitter:** el audio empieza a sonar con `PREROLL_MS` acumulados. Si el buffer se vacía, se pausa y vuelve a llenar, en lugar de seguir a trompicones.
-- **Paquetes RTP:** AAC-ELD es un códec con estado, así que un paquete duplicado o tardío corrompe lo que sigue. Se descartan por número de secuencia.
+- `AudioTrack` con el buffer mínimo del sistema × 4 y modo de rendimiento estándar. Con el buffer mínimo y el modo de baja latencia, el audio de AirPlay (44,1 kHz) no obtiene la pista rápida del mezclador de la TV (48 kHz): en un Chromecast HD el mezclador consume en bloques de 43 ms, el buffer de 85 ms se llenaba y vaciaba sin parar y el sonido salía robótico y con cortes.
+- **Colchón con control de nivel:** la app mantiene una cola de audio objetivo igual al buffer mínimo de cada TV (unos 2 bloques de su mezclador). Arranca rellenando con silencio hasta ese nivel. Una vez por segundo ajusta la velocidad de reproducción hasta ±0,5 % (inaudible) para volver al objetivo, lo que también absorbe la diferencia de reloj con la Mac.
+- **Underruns:** si la cola se vacía, se repone con silencio sin pausar la pista y el objetivo sube 30 ms (hasta el doble del mínimo). Tras un minuto sin cortes vuelve a bajar poco a poco.
+- **Cola acotada:** la Mac manda una ráfaga de audio al empezar. Si la cola pasa de 3 × el mínimo, se descarta lo que llega hasta volver al objetivo; si no, el audio quedaría atrasado para siempre. Se nota como un corte breve, una sola vez.
+- **Paquetes RTP:** AAC-ELD es un códec con estado, así que un paquete duplicado o tardío corrompe lo que sigue. Se descartan por número de secuencia. Los paquetes «sin datos» que AirPlay manda al empezar se saltan sin decodificar.
 - **`WifiLock` en modo de baja latencia** mientras la app está abierta. Sin él, el Wi-Fi de la TV entra en ahorro de energía y el tráfico llega a ráfagas (en una TV de prueba, el ping en reposo variaba entre 4 y 69 ms), lo que se oye como microcortes.
 - **Hilo de audio con prioridad `URGENT_AUDIO`** y buffer de socket UDP de 256 KB, para que el decodificador de video no le quite CPU.
 
@@ -198,8 +201,10 @@ Esta app corre en TV con poca potencia (por ejemplo, un MediaTek MT5867 con meno
 
 ```bash
 adb connect <IP-DE-LA-TV>:5555
-adb logcat -s AirPlayService LowLatencyAudio HardwareH264Decoder
+adb logcat -s AirPlayService AirPlayAudio LowLatencyAudio HardwareH264Decoder
 ```
+
+La versión instalada se ve en la pantalla de inicio (`v2.0.N`, el mismo número que la Release de GitHub).
 
 La pantalla de inicio de la TV también muestra los últimos eventos al pie.
 
@@ -207,9 +212,15 @@ La pantalla de inicio de la TV también muestra los últimos eventos al pie.
 
 | Log | Campo | Qué significa |
 |---|---|---|
-| `LowLatencyAudio` | `rearms` | Veces que el audio se quedó sin datos y tuvo que volver a llenar el colchón. Debería ser 0 o muy bajo. |
-| | `drops` | Escrituras que no cupieron en el buffer (audio llegando más rápido de lo que suena). |
-| | `underrunsTrack` | Vaciados del buffer del `AudioTrack` reportados por Android. |
+| `LowLatencyAudio` | `nivel` / `objetivo` | Cola mínima de audio del último segundo y la que se busca mantener (ms). Deberían estar cerca. |
+| | `rate` | Velocidad de reproducción aplicada (Hz). Se mueve hasta ±0,5 % alrededor de 44100. |
+| | `underruns` | Veces que la cola se vació en los últimos 5 s. Debería ser 0 tras el arranque. |
+| | `silencios` | Rellenos de silencio (uno al arrancar y uno por underrun). |
+| | `drops` | Bloques descartados por cola demasiado larga. Solo al empezar o tras una ráfaga. |
+| `AirPlayAudio` | `paquetes` | Paquetes RTP de audio recibidos en 5 s (unos 460). |
+| | `perdidos` / `tardios` | Paquetes que nunca llegaron y paquetes duplicados o fuera de orden. Si suben, el problema es la red. |
+| | `sinBuffer` | Paquetes que el decodificador AAC no pudo aceptar a tiempo (TV sin CPU libre). |
+| | `huecoMax` | Mayor pausa entre dos paquetes (ms). Indica el jitter del Wi-Fi; lo normal es 10–30. |
 | `HardwareH264Decoder` | `in` / `out` | Cuadros enviados al decodificador y cuadros mostrados en 5 s. Si `out` es mucho menor que `in`, el decodificador no da abasto. |
 | | `dropped` | Cuadros descartados porque la cola estaba llena. |
 | | `queue` | Cuadros esperando. Si crece sin parar, la TV no puede con el flujo. |
@@ -223,7 +234,7 @@ La pantalla de inicio de la TV también muestra los últimos eventos al pie.
 
 - **La TV no aparece en AirPlay:** comprueba que ambos estén en la misma red y que el router no tenga *aislamiento de clientes* (AP isolation) ni bloquee mDNS/multicast. Desde la Mac puedes comprobarlo con `dns-sd -B _airplay._tcp local.`
 - **Aparece con otro nombre:** el nombre sale de *Ajustes → Acerca de → Nombre del dispositivo* de la TV. Ver [Configuración](#nombre-de-la-tv-en-el-menú-de-duplicar).
-- **El audio suena con cortes o chasquidos:** mira `rearms` y `underrunsTrack` en el log. Si suben, sube `PREROLL_MS`, acerca la TV al router y, si la TV lo permite, conéctala por **cable Ethernet** o a la banda de **5 GHz**. Muchas TV solo tienen Wi-Fi n de 2,4 GHz, que se satura con 1080p a 60 fps.
+- **El audio suena con cortes o chasquidos:** comprueba primero que la TV tiene la última versión. Luego mira `underruns` en `LowLatencyAudio` y `perdidos`/`huecoMax` en `AirPlayAudio`. Si suben, acerca la TV al router y, si la TV lo permite, conéctala por **cable Ethernet** o a la banda de **5 GHz**. Muchas TV solo tienen Wi-Fi n de 2,4 GHz, que se satura con 1080p a 60 fps.
 - **El audio no va sincronizado con la imagen:** calibra `av_delay_ms`. Ver [Sincronía de audio y video](#sincronía-de-audio-y-video).
 - **La imagen se ve lenta o entrecortada:** mira `in`, `out` y `queue` de `HardwareH264Decoder`. Si `out` es mucho menor que `in`, el decodificador de la TV no da abasto con 1080p a 60 fps. Prueba con `av_delay_ms` en `0` para descartar el retardo.
 - **En la Mac se queda en modo *Extender* y no deja pasar a *Duplicar*:** cambia el modo en *Ajustes del Sistema → Pantallas*, o desconecta y vuelve a conectar la duplicación.
@@ -266,7 +277,7 @@ La tarea `injectFairPlayEngine` descarga en `preBuild` el motor FairPlay de [`se
 | `AirPlayAudioDecoder.kt` | Decodifica el audio AAC (ELD/LC) de AirPlay y descarta paquetes fuera de orden |
 | `HardwareH264Decoder.kt` | Decodificador H.264 por hardware (MediaCodec), línea de retardo A/V y estadísticas |
 | `AvSync.kt` | Calcula el retardo de video a partir de las marcas de tiempo de video y audio |
-| `LowLatencyAudioPlayer.kt` | Reproducción de audio PCM con colchón anti-jitter |
+| `LowLatencyAudioPlayer.kt` | Reproducción de audio PCM con colchón de nivel controlado |
 | `NativeStreamServer.kt` | Servidor HTTP/HTTPS + WebSocket del emisor web y subida de archivos |
 | `DlnaSsdpService.kt` | Descubrimiento DLNA/UPnP |
 | `XboxCloudActivity.kt` | Acceso a Xbox Cloud Gaming en un WebView |

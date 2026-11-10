@@ -63,6 +63,15 @@ class AirPlayBonjourService(
     private var audioDataUdp7103: DatagramSocket? = null
     private var audioCtrlUdp7104: DatagramSocket? = null
 
+    // Identidad derivada del ANDROID_ID: con valores fijos, dos TV en la misma red se anunciaban como el mismo receptor
+    private val idHash = MessageDigest.getInstance("SHA-256").digest(
+        (android.provider.Settings.Secure.getString(context.contentResolver, android.provider.Settings.Secure.ANDROID_ID) ?: "OmniCast").toByteArray()
+    )
+    // Primer byte: bit "administrada localmente" puesto y bit multicast apagado, como una MAC unicast válida
+    private val macCompact = idHash.copyOf(6).also { it[0] = ((it[0].toInt() and 0xFE) or 0x02).toByte() }.joinToString("") { "%02X".format(it) }
+    private val macAddress = macCompact.chunked(2).joinToString(":")
+    private val pairingId = java.util.UUID.nameUUIDFromBytes(idHash).toString()
+
     private val edCurveSpec = EdDSANamedCurveTable.getByName(EdDSANamedCurveTable.ED_25519)
     private val edPrivateKey: EdDSAPrivateKey
     private val edPublicKey: EdDSAPublicKey
@@ -70,7 +79,7 @@ class AirPlayBonjourService(
     private val edPublicKeyHex: String
 
     init {
-        val seed = MessageDigest.getInstance("SHA-256").digest("OmniCastGoogleTV-Ed25519-Seed".toByteArray())
+        val seed = MessageDigest.getInstance("SHA-256").digest("OmniCastGoogleTV-Ed25519-Seed".toByteArray() + idHash)
         val privSpec = EdDSAPrivateKeySpec(seed, edCurveSpec)
         edPrivateKey = EdDSAPrivateKey(privSpec)
         val pubSpec = EdDSAPublicKeySpec(privSpec.a, edCurveSpec)
@@ -78,9 +87,6 @@ class AirPlayBonjourService(
         edPublicKeyBytes = edPublicKey.abyte
         edPublicKeyHex = edPublicKeyBytes.joinToString("") { "%02x".format(it) }
     }
-
-    private val macAddress = "AA:BB:CC:11:22:33"
-    private val macCompact = "AABBCC112233"
 
     // Instancia directa de FairPlay SAP v2.5 (mantiene el estado de fp-setup para descifrar ekey)
     @Volatile private var fairPlay = FairPlay()
@@ -132,7 +138,7 @@ class AirPlayBonjourService(
                     "features" to "0x5A7FFFF7,0x1E",
                     "flags" to "0x4",
                     "model" to "AppleTV3,2",
-                    "pi" to "b08f5a79-db29-4384-b456-a4784d9e6055",
+                    "pi" to pairingId,
                     "pk" to edPublicKeyHex,
                     "srcvers" to "220.68",
                     "vv" to "2"
@@ -619,18 +625,20 @@ class AirPlayBonjourService(
             try {
                 // Descifrado in-place sobre el buffer del socket (sin copias por paquete).
                 // Solo se cifran los bloques completos de 16B; el resto viaja en claro. El IV se reinicia en cada paquete
-                val payloadLen = len - 12
+                var payloadLen = len - 12
+                // Marcador "sin datos" de AirPlay (va en claro): no es AAC, descifrarlo y decodificarlo mete basura al códec
+                if (payloadLen == 16 && buf[12].toInt() == 0x00 && buf[13].toInt() == 0x68 && buf[14].toInt() == 0x34 && buf[15].toInt() == 0x00) payloadLen = 0
                 val encLen = (payloadLen / 16) * 16
                 if (encLen > 0) {
                     cipher.init(Cipher.DECRYPT_MODE, key, iv)
                     cipher.update(buf, 12, encLen, buf, 12)
                 }
-                if (!logged) {
+                if (!logged && payloadLen > 0) {
                     logged = true
                     logTv("Primer paquete de audio recibido (${payloadLen}B)")
                 }
                 val seq = ((buf[2].toInt() and 0xFF) shl 8) or (buf[3].toInt() and 0xFF)
-                AvSync.onAudio(ByteBuffer.wrap(buf).getInt(4).toLong() and 0xFFFFFFFFL, android.os.SystemClock.elapsedRealtime())
+                if (payloadLen > 0) AvSync.onAudio(ByteBuffer.wrap(buf).getInt(4).toLong() and 0xFFFFFFFFL, android.os.SystemClock.elapsedRealtime())
                 audioDecoder.decode(buf, 12, payloadLen, seq)
             } catch (e: Throwable) {
                 if (!logged) {
@@ -806,7 +814,7 @@ class AirPlayBonjourService(
         root["protovers"] = NSString("1.0")
         root["srcvers"] = NSString("220.68")
         root["vv"] = NSNumber(2)
-        root["pi"] = NSString("b08f5a79-db29-4384-b456-a4784d9e6055")
+        root["pi"] = NSString(pairingId)
         root["pk"] = NSData(edPublicKeyBytes)
         root["statusFlags"] = NSNumber(68)
         root["keepAliveLowPower"] = NSNumber(1)

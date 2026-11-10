@@ -17,8 +17,10 @@ android {
         applicationId = "com.omnicast.tv"
         minSdk = 24
         targetSdk = 34
-        versionCode = 12
-        versionName = "2.8.0-Native"
+        // En CI la versión es el número de run (igual que el tag de la Release): así se ve en la TV qué build está instalado
+        val ciRun = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = ciRun ?: 12
+        versionName = ciRun?.let { "2.0.$it" } ?: "2.8.0-Native"
     }
 
     // Keystore fija (secreto de CI) para que cada versión se instale encima de la anterior sin desinstalar.
@@ -189,4 +191,5 @@ dependencies {
     implementation("com.googlecode.plist:dd-plist:1.27")
     implementation("org.slf4j:slf4j-api:1.7.36")
     implementation("org.slf4j:slf4j-simple:1.7.36")
+    testImplementation("junit:junit:4.13.2")
 }
